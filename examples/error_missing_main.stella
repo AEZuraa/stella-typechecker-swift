@@ -1,0 +1,7 @@
+language core;
+
+fn helper(n : Nat) -> Nat {
+    return succ(n)
+}
+
+// No main function!

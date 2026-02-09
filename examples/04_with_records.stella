@@ -1,0 +1,14 @@
+language core;
+extend with #records;
+
+fn make_point(x : Nat, y : Nat) -> {x : Nat, y : Nat} {
+    return {x = x, y = y}
+}
+
+fn get_x(point : {x : Nat, y : Nat}) -> Nat {
+    return point.x
+}
+
+fn main(n : Nat) -> Nat {
+    return get_x(make_point(n, succ(n)))
+}

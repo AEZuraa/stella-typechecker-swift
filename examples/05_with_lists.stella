@@ -1,0 +1,14 @@
+language core;
+extend with #lists;
+
+fn make_list(n : Nat) -> [Nat] {
+    return [n, succ(n), succ(succ(n))]
+}
+
+fn get_head(list : [Nat]) -> Nat {
+    return List::head(list)
+}
+
+fn main(n : Nat) -> Nat {
+    return get_head(make_list(n))
+}

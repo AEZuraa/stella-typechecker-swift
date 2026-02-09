@@ -1,0 +1,9 @@
+language core;
+extend with #sum-types;
+
+fn main(n : Nat) -> Nat {
+    return match inl(n) {
+        inl(x) => x
+        | inr(y) => 0
+    }
+}

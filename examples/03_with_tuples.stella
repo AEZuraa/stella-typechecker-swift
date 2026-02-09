@@ -1,0 +1,14 @@
+language core;
+extend with #unit-type, #tuples;
+
+fn make_pair(n : Nat) -> {Nat, Bool} {
+    return {n, true}
+}
+
+fn get_first(pair : {Nat, Bool}) -> Nat {
+    return pair.1
+}
+
+fn main(n : Nat) -> Nat {
+    return get_first(make_pair(n))
+}

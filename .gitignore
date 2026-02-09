@@ -1,0 +1,52 @@
+# Swift Package Manager
+.DS_Store
+/.build
+/Packages
+*.xcodeproj
+xcuserdata/
+DerivedData/
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.netrc
+
+# Xcode
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xcworkspace
+!default.xcworkspace
+*.xccheckout
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Build artifacts
+.build/
+build/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Swift
+*.swp
+*~.nib
+*.swiftmodule
+*.swiftdoc
+
+# IDEs
+.vscode/
+.idea/
+.cursor/
+terminals/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Logs / temporary
+*.log

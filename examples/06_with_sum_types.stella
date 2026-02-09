@@ -1,0 +1,21 @@
+language core;
+extend with #sum-types;
+
+fn make_left(n : Nat) -> Nat + Bool {
+    return inl(n)
+}
+
+fn make_right(b : Bool) -> Nat + Bool {
+    return inr(b)
+}
+
+fn process(x : Nat + Bool) -> Nat {
+    return match x {
+        inl(n) => n
+        | inr(b) => if b then succ(0) else 0
+    }
+}
+
+fn main(n : Nat) -> Nat {
+    return process(make_left(n))
+}

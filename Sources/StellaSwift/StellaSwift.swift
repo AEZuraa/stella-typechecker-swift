@@ -5,6 +5,8 @@ import Foundation
 import Antlr4
 #if os(Linux)
 import Glibc
+#elseif os(Windows)
+import CRT
 #else
 import Darwin
 #endif
@@ -43,7 +45,11 @@ struct StellaSwift {
             }
         } else {
             // Check if there is piped input (not terminal)
+            #if os(Windows)
+            let isInputFromTerminal = _isatty(STDIN_FILENO) != 0
+            #else
             let isInputFromTerminal = isatty(STDIN_FILENO) == 1
+            #endif
             
             if !isInputFromTerminal {
                 // Reading from stdin (pipe or redirect)

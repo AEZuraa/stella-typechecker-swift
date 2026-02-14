@@ -40,7 +40,7 @@ The tool is designed to be **command-line only** and to work correctly with **st
   4. Running the **type checker** on the AST.
 - **Output**:
   - If the program is **well-typed**:
-    - prints `Type checking successful!` to **stdout**;
+    - produces no output;
     - exits with code **0**.
   - If a **type error** is found:
     - prints **one error message** to **stderr** (with one of the specified error codes, e.g. `ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION`);

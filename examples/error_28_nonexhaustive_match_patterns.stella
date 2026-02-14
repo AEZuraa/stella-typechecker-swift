@@ -1,0 +1,10 @@
+// Expected error: ERROR_NONEXHAUSTIVE_MATCH_PATTERNS
+language core;
+
+extend with #sum-types, #type-ascriptions;
+
+fn main(n : Nat) -> Bool {
+    return match inl(n) as (Nat + Bool) {
+        inl(x) => Nat::iszero(x)
+    }
+}

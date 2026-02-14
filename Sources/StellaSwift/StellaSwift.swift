@@ -46,7 +46,7 @@ struct StellaSwift {
         } else {
             // Check if there is piped input (not terminal)
             #if os(Windows)
-            let isInputFromTerminal = _isatty(STDIN_FILENO) != 0
+            let isInputFromTerminal = _isatty(0) != 0   // 0 = stdin fd
             #else
             let isInputFromTerminal = isatty(STDIN_FILENO) == 1
             #endif
@@ -113,8 +113,7 @@ struct StellaSwift {
             let typeChecker = TypeChecker()
             try typeChecker.typecheck(program: program)
             
-            // Successful type checking
-            print("Type checking successful!")
+            // Successful type checking — exit with code 0
             exit(0)
             
         } catch let error as TypeCheckError {

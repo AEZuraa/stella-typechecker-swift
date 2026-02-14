@@ -1,0 +1,8 @@
+// Expected error: ERROR_UNEXPECTED_INJECTION
+language core;
+
+extend with #sum-types;
+
+fn main(n : Nat) -> Nat {
+    return inl(n)
+}

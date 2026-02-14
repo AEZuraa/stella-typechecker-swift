@@ -210,6 +210,28 @@ indirect enum Pattern: Sendable { // Patterns for pattern matching
     }
 }
 
+extension Pattern: CustomStringConvertible {
+    var description: String {
+        switch self {
+        case .patternVar(let name, _): return name
+        case .patternInt(let n, _): return "\(n)"
+        case .patternSucc(let p, _): return "succ(\(p))"
+        case .patternTrue: return "true"
+        case .patternFalse: return "false"
+        case .patternUnit: return "unit"
+        case .patternInl(let p, _): return "inl(\(p))"
+        case .patternInr(let p, _): return "inr(\(p))"
+        case .patternTuple(let ps, _): return "{\(ps.map { "\($0)" }.joined(separator: ", "))}"
+        case .patternRecord(let ps, _): return "{\(ps.map { "\($0.label) = \($0.pattern)" }.joined(separator: ", "))}"
+        case .patternList(let ps, _): return "[\(ps.map { "\($0)" }.joined(separator: ", "))]"
+        case .patternCons(let h, let t, _): return "cons(\(h), \(t))"
+        case .patternVariant(let label, let p, _):
+            if let p = p { return "<|\(label) = \(p)|>" } else { return "<|\(label)|>" }
+        case .patternAsc(let p, let t, _): return "\(p) as \(t)"
+        }
+    }
+}
+
 struct LabelledPattern: Sendable {
     let label: String
     let pattern: Pattern
@@ -252,6 +274,54 @@ extension Expr: CustomStringConvertible {
             return "\(fun)(\(argsStr))"
         case .ifExpr(let cond, let then, let else_, _):
             return "if \(cond) then \(then) else \(else_)"
+        case .succ(let n, _):
+            return "succ(\(n))"
+        case .pred(let n, _):
+            return "Nat::pred(\(n))"
+        case .isZero(let n, _):
+            return "Nat::iszero(\(n))"
+        case .natRec(let n, let z, let s, _):
+            return "Nat::rec(\(n), \(z), \(s))"
+        case .letExpr(let bindings, let body, _):
+            let bindStr = bindings.map { "\($0.pattern) = \($0.rhs)" }.joined(separator: ", ")
+            return "let \(bindStr) in \(body)"
+        case .typeAsc(let expr, let type, _):
+            return "\(expr) as \(type)"
+        case .tuple(let exprs, _):
+            return "{\(exprs.map { "\($0)" }.joined(separator: ", "))}"
+        case .dotTuple(let expr, let index, _):
+            return "\(expr).\(index)"
+        case .record(let bindings, _):
+            return "{\(bindings.map { "\($0.name) = \($0.rhs)" }.joined(separator: ", "))}"
+        case .dotRecord(let expr, let label, _):
+            return "\(expr).\(label)"
+        case .inl(let expr, _):
+            return "inl(\(expr))"
+        case .inr(let expr, _):
+            return "inr(\(expr))"
+        case .match(let expr, let cases, _):
+            let casesStr = cases.map { "\($0.pattern) => \($0.expr)" }.joined(separator: " | ")
+            return "match \(expr) { \(casesStr) }"
+        case .list(let exprs, _):
+            return "[\(exprs.map { "\($0)" }.joined(separator: ", "))]"
+        case .consList(let head, let tail, _):
+            return "cons(\(head), \(tail))"
+        case .head(let list, _):
+            return "List::head(\(list))"
+        case .tail(let list, _):
+            return "List::tail(\(list))"
+        case .isEmpty(let list, _):
+            return "List::isempty(\(list))"
+        case .variant(let label, let expr, _):
+            if let expr = expr {
+                return "<\(label) = \(expr)>"
+            } else {
+                return "<\(label)>"
+            }
+        case .fix(let expr, _):
+            return "fix(\(expr))"
+        case .parenthesised(let expr, _):
+            return "(\(expr))"
         default:
             return "Expr(...)"
         }

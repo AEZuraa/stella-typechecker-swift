@@ -1,0 +1,8 @@
+// Expected error: ERROR_UNEXPECTED_RECORD_FIELDS
+language core;
+
+extend with #records;
+
+fn main(n : Nat) -> {x : Nat} {
+    return {x = n, y = true}
+}

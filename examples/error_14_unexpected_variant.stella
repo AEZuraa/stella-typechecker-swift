@@ -1,0 +1,8 @@
+// Expected error: ERROR_UNEXPECTED_VARIANT
+language core;
+
+extend with #variants;
+
+fn main(n : Nat) -> Nat {
+    return <| x = n |>
+}

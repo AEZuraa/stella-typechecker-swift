@@ -1,0 +1,8 @@
+// Expected error: ERROR_DUPLICATE_VARIANT_TYPE_FIELDS
+language core;
+
+extend with #variants;
+
+fn main(n : Nat) -> <| x : Nat, x : Bool |> {
+    return <| x = n |>
+}

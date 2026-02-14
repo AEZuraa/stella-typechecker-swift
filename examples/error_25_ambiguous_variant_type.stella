@@ -1,0 +1,10 @@
+// Expected error: ERROR_AMBIGUOUS_VARIANT_TYPE
+language core;
+
+extend with #variants;
+
+fn main(n : Nat) -> Nat {
+    return match <| x = n |> {
+        <| x = y |> => y
+    }
+}

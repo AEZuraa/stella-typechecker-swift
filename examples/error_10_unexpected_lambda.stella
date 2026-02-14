@@ -1,0 +1,6 @@
+// Expected error: ERROR_UNEXPECTED_LAMBDA
+language core;
+
+fn main(n : Nat) -> Nat {
+    return fn(x : Nat) { return x }
+}

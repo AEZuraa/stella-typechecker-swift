@@ -1,0 +1,6 @@
+// Expected error: ERROR_MISSING_MAIN
+language core;
+
+fn not_main(n : Nat) -> Nat {
+    return succ(n)
+}

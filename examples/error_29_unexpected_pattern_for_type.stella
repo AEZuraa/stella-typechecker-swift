@@ -1,0 +1,11 @@
+// Expected error: ERROR_UNEXPECTED_PATTERN_FOR_TYPE
+language core;
+
+extend with #sum-types;
+
+fn main(n : Nat) -> Nat {
+    return match n {
+        inl(x) => x
+      | inr(y) => y
+    }
+}

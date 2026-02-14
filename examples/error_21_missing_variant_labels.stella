@@ -1,0 +1,8 @@
+// Expected error: ERROR_MISSING_VARIANT_LABELS
+language core;
+
+extend with #variants, #type-ascriptions;
+
+fn main(n : Nat) -> <| a : Nat, b : Bool |> {
+    return <| a = n |> as <| a : Nat |>
+}

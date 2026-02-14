@@ -1,0 +1,8 @@
+// Expected error: ERROR_UNEXPECTED_VARIANT_LABEL
+language core;
+
+extend with #variants;
+
+fn main(n : Nat) -> <| x : Nat, y : Bool |> {
+    return <| z = n |>
+}

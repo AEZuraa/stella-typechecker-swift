@@ -1,0 +1,8 @@
+// Expected error: ERROR_TUPLE_INDEX_OUT_OF_BOUNDS
+language core;
+
+extend with #tuples;
+
+fn main(n : Nat) -> Nat {
+    return {n, true}.3
+}

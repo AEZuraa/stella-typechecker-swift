@@ -1,0 +1,12 @@
+// Expected error: ERROR_UNEXPECTED_FIELD_ACCESS
+language core;
+
+extend with #records;
+
+fn get_missing(r : {x : Nat}) -> Nat {
+    return r.y
+}
+
+fn main(n : Nat) -> Nat {
+    return get_missing({x = n})
+}

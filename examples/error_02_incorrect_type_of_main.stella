@@ -1,0 +1,8 @@
+// Expected error: ERROR_INCORRECT_TYPE_OF_MAIN
+language core;
+
+extend with #multiparameter-functions;
+
+fn main(n : Nat, m : Bool) -> Nat {
+    return n
+}

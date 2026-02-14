@@ -1,0 +1,6 @@
+// Expected error: ERROR_UNDEFINED_VARIABLE
+language core;
+
+fn main(n : Nat) -> Nat {
+    return succ(undefined_var)
+}

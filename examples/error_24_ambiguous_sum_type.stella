@@ -1,9 +1,11 @@
+// Expected error: ERROR_AMBIGUOUS_SUM_TYPE
 language core;
+
 extend with #sum-types;
 
 fn main(n : Nat) -> Nat {
-    return match inl(n) {
+    return match inl(0) {
         inl(x) => x
-        | inr(y) => 0
+      | inr(y) => y
     }
 }

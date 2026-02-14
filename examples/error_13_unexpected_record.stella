@@ -1,0 +1,8 @@
+// Expected error: ERROR_UNEXPECTED_RECORD
+language core;
+
+extend with #records;
+
+fn main(n : Nat) -> Nat {
+    return {x = n, y = true}
+}

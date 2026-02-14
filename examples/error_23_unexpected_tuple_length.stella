@@ -1,0 +1,8 @@
+// Expected error: ERROR_UNEXPECTED_TUPLE_LENGTH
+language core;
+
+extend with #tuples;
+
+fn main(n : Nat) -> {Nat, Bool} {
+    return {n, true, 0}
+}

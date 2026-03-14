@@ -1,0 +1,8 @@
+// ERROR_NOT_A_REFERENCE (assignment to non-reference)
+// Attempting to assign to an expression that is not of reference type.
+language core;
+extend with #references, #unit-type;
+
+fn main(n : Nat) -> Unit {
+  return n := succ(0)   // n : Nat, not &Nat — cannot assign
+}

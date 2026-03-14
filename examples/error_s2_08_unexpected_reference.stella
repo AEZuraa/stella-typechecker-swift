@@ -1,0 +1,8 @@
+// ERROR_UNEXPECTED_REFERENCE
+// new(e) is used where a non-reference type (Nat) is expected.
+language core;
+extend with #references;
+
+fn main(n : Nat) -> Nat {
+  return new(n)   // new(n) : &Nat, but Nat is expected
+}

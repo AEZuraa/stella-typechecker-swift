@@ -1,0 +1,12 @@
+// ERROR_AMBIGUOUS_REFERENCE_TYPE
+// A memory address literal is used where no expected type can be determined
+// and #ambiguous-type-as-bottom is not enabled.
+// Memory address syntax in Stella: <0xHEX>
+language core;
+extend with #references, #let-bindings;
+
+fn main(n : Nat) -> Nat {
+  // <0x42> is a memory address literal; in let-binding synthesis mode,
+  // the expected reference type is unknown → ERROR_AMBIGUOUS_REFERENCE_TYPE
+  return let r = <0x42> in *r
+}

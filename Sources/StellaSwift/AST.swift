@@ -39,6 +39,8 @@ enum Decl: Sendable {
         returnExpr: Expr,
         position: SourcePosition
     )
+    /// Top-level exception type declaration: `exception type = T`
+    case declExceptionType(type: Type, position: SourcePosition)
 }
 
 struct ParamDecl: Sendable { // represents a function parameter (`n : Nat`)
@@ -59,6 +61,9 @@ indirect enum Type: Sendable {
     case sum(left: Type, right: Type)                      // T1 + T2
     case list(Type)                                        // [T]
     case variant([VariantFieldType])                       // <|l1: T1, l2: T2|>
+    case ref(Type)                                         // &T  (#references)
+    case top                                               // Top (#top-type)
+    case bot                                               // Bot (#bottom-type)
     
     var position: SourcePosition {
         return .unknown // can be expanded for storage of items
@@ -152,8 +157,25 @@ indirect enum Expr: Sendable {
     case equal(left: Expr, right: Expr, SourcePosition)
     case notEqual(left: Expr, right: Expr, SourcePosition)
     
-    // Sequencing
+    // Sequencing (#sequencing)
     case sequence(expr1: Expr, expr2: Expr, SourcePosition)
+    
+    // References (#references)
+    case newRef(Expr, SourcePosition)                          // new(expr) — allocate a reference
+    case deref(Expr, SourcePosition)                           // *expr — dereference
+    case assign(lhs: Expr, rhs: Expr, SourcePosition)         // lhs := rhs — assignment
+    case constMemory(String, SourcePosition)                   // @address — explicit memory address
+
+    // Panic (#panic)
+    case panic_(SourcePosition)                                // panic! — unrecoverable error
+
+    // Exceptions (#exceptions)
+    case throw_(Expr, SourcePosition)                          // throw(expr)
+    case tryWith(tryExpr: Expr, fallbackExpr: Expr, SourcePosition)              // try { } with { }
+    case tryCatch(tryExpr: Expr, pattern: Pattern, fallbackExpr: Expr, SourcePosition) // try { } catch { pat => }
+
+    // Type cast (#type-cast)
+    case typeCast(expr: Expr, type: Type, SourcePosition)     // expr cast as Type
     
     // Parenthesised
     case parenthesised(Expr, SourcePosition)
@@ -174,7 +196,11 @@ indirect enum Expr: Sendable {
              .lessThan(_, _, let pos), .lessThanOrEqual(_, _, let pos),
              .greaterThan(_, _, let pos), .greaterThanOrEqual(_, _, let pos),
              .equal(_, _, let pos), .notEqual(_, _, let pos),
-             .sequence(_, _, let pos), .parenthesised(_, let pos):
+             .sequence(_, _, let pos), .parenthesised(_, let pos),
+             .newRef(_, let pos), .deref(_, let pos), .assign(_, _, let pos),
+             .constMemory(_, let pos), .panic_(let pos),
+             .throw_(_, let pos), .tryWith(_, _, let pos), .tryCatch(_, _, _, let pos),
+             .typeCast(_, _, let pos):
             return pos
         }
     }
@@ -320,6 +346,26 @@ extension Expr: CustomStringConvertible {
             }
         case .fix(let expr, _):
             return "fix(\(expr))"
+        case .sequence(let e1, let e2, _):
+            return "\(e1); \(e2)"
+        case .newRef(let expr, _):
+            return "new(\(expr))"
+        case .deref(let expr, _):
+            return "*\(expr)"
+        case .assign(let lhs, let rhs, _):
+            return "\(lhs) := \(rhs)"
+        case .constMemory(let addr, _):
+            return addr
+        case .panic_:
+            return "panic!"
+        case .throw_(let expr, _):
+            return "throw(\(expr))"
+        case .tryWith(let tryExpr, let fallback, _):
+            return "try { \(tryExpr) } with { \(fallback) }"
+        case .tryCatch(let tryExpr, let pat, let fallback, _):
+            return "try { \(tryExpr) } catch { \(pat) => \(fallback) }"
+        case .typeCast(let expr, let type, _):
+            return "\(expr) cast as \(type)"
         case .parenthesised(let expr, _):
             return "(\(expr))"
         default:
@@ -356,6 +402,12 @@ extension Type: CustomStringConvertible {
                 }
             }.joined(separator: ", ")
             return "<|\(fieldsStr)|>"
+        case .ref(let innerType):
+            return "&\(innerType)"
+        case .top:
+            return "Top"
+        case .bot:
+            return "Bot"
         }
     }
 }
@@ -388,6 +440,10 @@ extension Type: Equatable {
                     return false
                 }
             }
+            return true
+        case (.ref(let t1), .ref(let t2)):
+            return t1 == t2
+        case (.top, .top), (.bot, .bot):
             return true
         default:
             return false

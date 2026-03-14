@@ -232,6 +232,8 @@ extension StellaSwift {
                 }
             }
             print("\(indentStr)   Body: \(summarizeExpr(returnExpr))")
+        case .declExceptionType(let type, _):
+            print("\(indentStr)\(index). Exception type declaration: \(type)")
         }
     }
     
@@ -299,6 +301,24 @@ extension StellaSwift {
             return "comparison op"
         case .sequence:
             return "sequence"
+        case .newRef:
+            return "new(...)"
+        case .deref:
+            return "deref(...)"
+        case .assign:
+            return "assign(...)"
+        case .constMemory(let addr, _):
+            return "memory(\(addr))"
+        case .panic_:
+            return "panic!"
+        case .throw_:
+            return "throw(...)"
+        case .tryWith:
+            return "try-with"
+        case .tryCatch:
+            return "try-catch"
+        case .typeCast(_, let type, _):
+            return "cast-as(\(type))"
         case .parenthesised(let inner, _):
             return "(\(summarizeExpr(inner)))"
         }

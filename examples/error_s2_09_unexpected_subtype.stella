@@ -1,0 +1,10 @@
+// ERROR_UNEXPECTED_SUBTYPE
+// With #structural-subtyping enabled, this error is raised when the inferred type
+// is NOT a subtype of the expected type.
+// Example from the task PDF: assigning Top to a &Nat reference.
+language core;
+extend with #structural-subtyping, #references, #top-type, #unit-type, #type-ascriptions;
+
+fn main(x : &Nat) -> Unit {
+  return x := (0 as Top)  // 0 as Top : Top; Top is NOT a subtype of Nat
+}

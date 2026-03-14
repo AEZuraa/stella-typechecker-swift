@@ -1,0 +1,10 @@
+// ERROR_AMBIGUOUS_PANIC_TYPE
+// panic! is used as the RHS of a let binding — no expected type is known,
+// and #ambiguous-type-as-bottom is NOT enabled.
+language core;
+extend with #panic, #let-bindings;
+
+fn main(n : Nat) -> Nat {
+  // panic! as a let-binding RHS: type cannot be determined without context
+  return let x = panic! in x
+}

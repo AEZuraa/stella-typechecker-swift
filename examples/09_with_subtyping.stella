@@ -1,0 +1,13 @@
+// Well-typed program using structural subtyping (#structural-subtyping, #top-type)
+language core;
+extend with #structural-subtyping, #top-type, #pairs, #type-ascriptions;
+
+// dup accepts any Top value and duplicates it
+fn dup(x : Top) -> { Top, Top } {
+  return { x, x }
+}
+
+fn main(n : Nat) -> Nat {
+  // {Nat, Nat} <: {Top, Top}, so cast is valid
+  return (dup(n) cast as {Nat, Nat}).1
+}

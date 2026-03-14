@@ -1,0 +1,15 @@
+// Well-typed program using exceptions (#exceptions, #exception-type-declaration)
+language core;
+extend with #exceptions, #exception-type-declaration;
+
+// The declared exception type: all exceptions carry a Nat value
+exception type = Nat
+
+// This function always throws (return type Bool is satisfied because throw has Bot type)
+fn fail(n : Nat) -> Bool {
+  return throw(succ(0))
+}
+
+fn main(n : Nat) -> Bool {
+  return try { fail(n) } catch { a => true }
+}

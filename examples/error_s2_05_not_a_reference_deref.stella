@@ -1,0 +1,8 @@
+// ERROR_NOT_A_REFERENCE (dereference of non-reference)
+// Attempting to dereference an expression that is not of reference type.
+language core;
+extend with #references;
+
+fn main(n : Nat) -> Nat {
+  return *n   // n : Nat, not &Nat — cannot dereference
+}

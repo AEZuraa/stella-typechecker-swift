@@ -1,0 +1,9 @@
+// ERROR_UNEXPECTED_MEMORY_ADDRESS
+// A memory address literal is used where a non-reference type (Nat) is expected.
+// Memory address syntax in Stella: <0xHEX>
+language core;
+extend with #references;
+
+fn main(n : Nat) -> Nat {
+  return <0xDEAD>   // <0xDEAD> is a memory address &T; Nat is expected here
+}

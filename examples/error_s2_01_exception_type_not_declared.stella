@@ -1,0 +1,8 @@
+// ERROR_EXCEPTION_TYPE_NOT_DECLARED
+// Using throw without declaring an exception type
+language core;
+extend with #exceptions;
+
+fn main(n : Nat) -> Bool {
+  return throw(n)
+}

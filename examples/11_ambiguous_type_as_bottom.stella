@@ -1,0 +1,11 @@
+// Well-typed program using #ambiguous-type-as-bottom
+// Without this extension, inr(x) cannot be typed without context.
+// With it, inr(x) gets type Bot + Nat, which is a subtype of Bool + Nat.
+language core;
+extend with #ambiguous-type-as-bottom, #structural-subtyping, #sum-types;
+
+fn main(n : Nat) -> Bool + Nat {
+  return (fn (x : Nat) {
+    return inr(x)  // inferred type: Bot + Nat  (<: Bool + Nat with structural subtyping)
+  })(n)
+}

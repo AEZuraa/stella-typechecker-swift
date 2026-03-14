@@ -1,0 +1,28 @@
+// Well-typed program using panic! (#panic)
+// panic! has type Bot and can be used at any expected type
+language core;
+extend with #panic, #pairs, #fixpoint-combinator;
+
+// Compute predecessor safely — returns 0 for 0 (no actual panic in the example)
+fn dec(n : Nat) -> Nat {
+  return Nat::rec(n, 0,
+    fn(k : Nat) {
+      return fn(p : Nat) {
+        return k
+      }
+    })
+}
+
+// Division: panics on division by zero
+fn div(n : Nat) -> fn(Nat) -> Nat {
+  return fn(m : Nat) {
+    return
+      if Nat::iszero(m)
+      then panic!   // panic! checked against Nat — valid (Bot <: Nat)
+      else n
+  }
+}
+
+fn main(n : Nat) -> Nat {
+  return div(n)(succ(0))
+}

@@ -790,6 +790,116 @@ class ASTBuilder: stellaParserBaseListener {
             getPosition(ctx)
         ))
     }
+    
+    // MARK: - Stage 2: Types (#references, #top-type, #bottom-type)
+    
+    /// &T — reference type
+    override func exitTypeRef(_ ctx: stellaParser.TypeRefContext) {
+        guard let innerType = typeStack.popLast() else {
+            fatalError("Missing inner type in TypeRef")
+        }
+        typeStack.append(.ref(innerType))
+    }
+    
+    /// Top — top type
+    override func exitTypeTop(_ ctx: stellaParser.TypeTopContext) {
+        typeStack.append(.top)
+    }
+    
+    /// Bot — bottom type
+    override func exitTypeBottom(_ ctx: stellaParser.TypeBottomContext) {
+        typeStack.append(.bot)
+    }
+    
+    // MARK: - Stage 2: Declarations (#exception-type-declaration)
+    
+    /// exception type = T
+    override func exitDeclExceptionType(_ ctx: stellaParser.DeclExceptionTypeContext) {
+        guard let exType = typeStack.popLast() else {
+            fatalError("Missing type in exception type declaration")
+        }
+        declStack.append(.declExceptionType(type: exType, position: getPosition(ctx)))
+    }
+    
+    // MARK: - Stage 2: Expressions (#references)
+    
+    /// new(expr) — allocate a reference cell
+    override func exitRef(_ ctx: stellaParser.RefContext) {
+        guard let expr = exprStack.popLast() else {
+            fatalError("Missing expression in Ref (new)")
+        }
+        exprStack.append(.newRef(expr, getPosition(ctx)))
+    }
+    
+    /// *expr — dereference a reference cell
+    override func exitDeref(_ ctx: stellaParser.DerefContext) {
+        guard let expr = exprStack.popLast() else {
+            fatalError("Missing expression in Deref")
+        }
+        exprStack.append(.deref(expr, getPosition(ctx)))
+    }
+    
+    /// lhs := rhs — assign to a reference cell
+    override func exitAssign(_ ctx: stellaParser.AssignContext) {
+        guard let rhs = exprStack.popLast(),
+              let lhs = exprStack.popLast() else {
+            fatalError("Missing operands in Assign")
+        }
+        exprStack.append(.assign(lhs: lhs, rhs: rhs, getPosition(ctx)))
+    }
+    
+    /// @address — explicit memory address literal
+    override func exitConstMemory(_ ctx: stellaParser.ConstMemoryContext) {
+        let addr = ctx.mem?.getText() ?? "@0"
+        exprStack.append(.constMemory(addr, getPosition(ctx)))
+    }
+    
+    // MARK: - Stage 2: Expressions (#panic)
+    
+    /// panic! — unrecoverable error (diverges, has any type)
+    override func exitPanic(_ ctx: stellaParser.PanicContext) {
+        exprStack.append(.panic_(getPosition(ctx)))
+    }
+    
+    // MARK: - Stage 2: Expressions (#exceptions)
+    
+    /// throw(expr)
+    override func exitThrow(_ ctx: stellaParser.ThrowContext) {
+        guard let expr = exprStack.popLast() else {
+            fatalError("Missing expression in Throw")
+        }
+        exprStack.append(.throw_(expr, getPosition(ctx)))
+    }
+    
+    /// try { tryExpr } with { fallbackExpr }
+    override func exitTryWith(_ ctx: stellaParser.TryWithContext) {
+        guard let fallback = exprStack.popLast(),
+              let tryExpr = exprStack.popLast() else {
+            fatalError("Missing expressions in TryWith")
+        }
+        exprStack.append(.tryWith(tryExpr: tryExpr, fallbackExpr: fallback, getPosition(ctx)))
+    }
+    
+    /// try { tryExpr } catch { pat => fallbackExpr }
+    override func exitTryCatch(_ ctx: stellaParser.TryCatchContext) {
+        guard let fallback = exprStack.popLast(),
+              let pat = patternStack.popLast(),
+              let tryExpr = exprStack.popLast() else {
+            fatalError("Missing parts in TryCatch")
+        }
+        exprStack.append(.tryCatch(tryExpr: tryExpr, pattern: pat, fallbackExpr: fallback, getPosition(ctx)))
+    }
+    
+    // MARK: - Stage 2: Expressions (#type-cast)
+    
+    /// expr cast as Type
+    override func exitTypeCast(_ ctx: stellaParser.TypeCastContext) {
+        guard let type = typeStack.popLast(),
+              let expr = exprStack.popLast() else {
+            fatalError("Missing expression or type in TypeCast")
+        }
+        exprStack.append(.typeCast(expr: expr, type: type, getPosition(ctx)))
+    }
 }
 
 // MARK: - Convenience Function

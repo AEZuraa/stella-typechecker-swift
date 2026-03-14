@@ -1,0 +1,13 @@
+// ERROR_AMBIGUOUS_THROW_TYPE
+// throw is used in synthesis mode (as a standalone let binding RHS)
+// without #ambiguous-type-as-bottom, so the return type of throw is unknown.
+language core;
+extend with #exceptions, #exception-type-declaration, #let-bindings;
+
+exception type = Nat
+
+fn main(n : Nat) -> Nat {
+  // throw(n) is the RHS of a let binding — type is inferred, not checked
+  // Without #ambiguous-type-as-bottom, this is an ERROR_AMBIGUOUS_THROW_TYPE
+  return let x = throw(n) in x
+}

@@ -25,7 +25,7 @@ let package = Package(
             dependencies: [
                 .product(name: "Antlr4", package: "antlr4")
             ],
-            path: "Sources/StellaSwift",
+            path: "Sources/StellaSwift"
 //            swiftSettings: [
 //                // to suppress concurrency warnings from ANTLR
 //                .unsafeFlags([

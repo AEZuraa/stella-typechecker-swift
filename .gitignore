@@ -43,7 +43,6 @@ build/
 .idea/
 .cursor/
 terminals/
-/hw1
 
 # Temporary files
 *.tmp

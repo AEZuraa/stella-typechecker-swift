@@ -26,13 +26,6 @@ let package = Package(
                 .product(name: "Antlr4", package: "antlr4")
             ],
             path: "Sources/StellaSwift"
-//            swiftSettings: [
-//                // to suppress concurrency warnings from ANTLR
-//                .unsafeFlags([
-//                    "-Xfrontend", "-disable-availability-checking",
-//                    "-Xfrontend", "-warn-concurrency"
-//                ])
-//            ]
         )
     ]
 )

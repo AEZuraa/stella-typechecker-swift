@@ -560,12 +560,39 @@ class TypeChecker {
             }
 
             for (param, expectedParamType) in zip(params, expectedParamTypes) {
-                if param.paramType != expectedParamType {
-                    throw TypeCheckError.errorUnexpectedTypeForParameter(
-                        expected: expectedParamType,
-                        found: param.paramType,
-                        position: param.position
-                    )
+                if structuralSubtyping {
+                    // Contravariance: expectedParamType must be a subtype of the declared param type
+                    if !isSubtype(expectedParamType, param.paramType) {
+                        if case .record(let paramFields) = param.paramType,
+                           case .record(_) = expectedParamType {
+                            let expectedLabels = Set(expectedParamTypes.flatMap { t -> [String] in
+                                if case .record(let fs) = t { return fs.map { $0.label } }
+                                return []
+                            })
+                            let paramLabels = Set(paramFields.map { $0.label })
+                            let missing = paramLabels.subtracting(expectedLabels)
+                            if !missing.isEmpty {
+                                throw TypeCheckError.errorMissingRecordFields(
+                                    missing: Array(missing).sorted(), position: param.position
+                                )
+                            }
+                        }
+                        let inferredFnType = Type.function(
+                            paramTypes: params.map { $0.paramType },
+                            returnType: expectedReturnType
+                        )
+                        throw TypeCheckError.errorUnexpectedSubtype(
+                            expected: expectedType, found: inferredFnType, expr: expr
+                        )
+                    }
+                } else {
+                    if param.paramType != expectedParamType {
+                        throw TypeCheckError.errorUnexpectedTypeForParameter(
+                            expected: expectedParamType,
+                            found: param.paramType,
+                            position: param.position
+                        )
+                    }
                 }
             }
 
@@ -742,6 +769,31 @@ class TypeChecker {
         // === Propagate expected type through parentheses ===
         case (.parenthesised(let innerExpr, _), _):
             try checkExpr(innerExpr, expectedType: expectedType, context: context)
+
+        // === Propagate expected type through dereference ===
+        // *e checked against T means e must have type &T
+        case (.deref(let innerExpr, _), _):
+            try checkExpr(innerExpr, expectedType: .ref(expectedType), context: context)
+
+        // === Propagate expected type through try-with ===
+        case (.tryWith(let tryExpr, let fallback, _), _):
+            try checkExpr(tryExpr, expectedType: expectedType, context: context)
+            try checkExpr(fallback, expectedType: expectedType, context: context)
+
+        // === Propagate expected type through try-catch ===
+        case (.tryCatch(let tryExpr, let pat, let fallback, let pos), _):
+            guard let excType = exceptionType else {
+                throw TypeCheckError.errorExceptionTypeNotDeclared(position: pos)
+            }
+            try checkExpr(tryExpr, expectedType: expectedType, context: context)
+            var catchContext = context
+            try checkPattern(pat, against: excType, context: &catchContext)
+            try checkExpr(fallback, expectedType: expectedType, context: catchContext)
+
+        // === Propagate expected type through sequence ===
+        case (.sequence(let e1, let e2, _), _):
+            try checkExpr(e1, expectedType: .unit, context: context)
+            try checkExpr(e2, expectedType: expectedType, context: context)
 
         // === Specific structural-mismatch errors (must come before fallback default) ===
 

@@ -42,22 +42,22 @@ enum TypeCheckError: Error, CustomStringConvertible {
     case errorDuplicateVariantTypeFields(fields: [String], position: SourcePosition)
 
     // --- Stage 2 errors ---
-    /// Used exceptions without declaring `exception type = T`
     case errorExceptionTypeNotDeclared(position: SourcePosition)
-    /// `throw(e)` used in synthesis mode (no expected type) without #ambiguous-type-as-bottom
     case errorAmbiguousThrowType(position: SourcePosition)
-    /// `@address` used in synthesis mode (no expected type) without #ambiguous-type-as-bottom
     case errorAmbiguousReferenceType(position: SourcePosition)
-    /// `panic!` used in synthesis mode (no expected type) without #ambiguous-type-as-bottom
     case errorAmbiguousPanicType(position: SourcePosition)
-    /// Attempted to dereference or assign to an expression that is not of reference type
     case errorNotAReference(expr: Expr, actualType: Type, position: SourcePosition)
-    /// `@address` used where a non-reference type is expected
     case errorUnexpectedMemoryAddress(expected: Type, position: SourcePosition)
-    /// `new(e)` used where a non-reference type is expected
     case errorUnexpectedReference(expected: Type, position: SourcePosition)
-    /// Type of expression is not a subtype of the expected type (only when #structural-subtyping is on)
     case errorUnexpectedSubtype(expected: Type, found: Type, expr: Expr)
+
+    // --- Stage 3 errors ---
+    case errorOccursCheckInfiniteType(position: SourcePosition)
+    case errorNotAGenericFunction(expr: Expr, actualType: Type, position: SourcePosition)
+    case errorUndefinedTypeVariable(name: String, position: SourcePosition)
+    case errorAmbiguousType(position: SourcePosition)
+    case errorDuplicateTypeParameter(names: [String], position: SourcePosition)
+    case errorIncorrectNumberOfTypeArguments(expected: Int, found: Int, position: SourcePosition)
 
     var errorCode: String {
         switch self {
@@ -103,6 +103,13 @@ enum TypeCheckError: Error, CustomStringConvertible {
         case .errorUnexpectedMemoryAddress: return "ERROR_UNEXPECTED_MEMORY_ADDRESS"
         case .errorUnexpectedReference: return "ERROR_UNEXPECTED_REFERENCE"
         case .errorUnexpectedSubtype: return "ERROR_UNEXPECTED_SUBTYPE"
+        // Stage 3
+        case .errorOccursCheckInfiniteType: return "ERROR_OCCURS_CHECK_INFINITE_TYPE"
+        case .errorNotAGenericFunction: return "ERROR_NOT_A_GENERIC_FUNCTION"
+        case .errorUndefinedTypeVariable: return "ERROR_UNDEFINED_TYPE_VARIABLE"
+        case .errorAmbiguousType: return "ERROR_AMBIGUOUS_TYPE"
+        case .errorDuplicateTypeParameter: return "ERROR_DUPLICATE_TYPE_PARAMETER"
+        case .errorIncorrectNumberOfTypeArguments: return "ERROR_INCORRECT_NUMBER_OF_TYPE_ARGUMENTS"
         }
     }
 
@@ -413,6 +420,52 @@ enum TypeCheckError: Error, CustomStringConvertible {
             for expression
               \(expr)
             """
+
+        // --- Stage 3 error messages ---
+
+        case .errorOccursCheckInfiniteType(let pos):
+            return """
+            \(code):
+            Occurs check failed: unification would produce an infinite type
+            at line \(pos.line), column \(pos.column)
+            """
+
+        case .errorNotAGenericFunction(let expr, let actualType, let pos):
+            return """
+            \(code):
+            Attempting to apply type argument to a non-generic expression
+            Expression: \(expr)
+            Type: \(actualType)
+            at line \(pos.line), column \(pos.column)
+            """
+
+        case .errorUndefinedTypeVariable(let name, let pos):
+            return """
+            \(code):
+            Undefined type variable '\(name)'
+            at line \(pos.line), column \(pos.column)
+            """
+
+        case .errorAmbiguousType(let pos):
+            return """
+            \(code):
+            Ambiguous type variable remains where a concrete type is needed
+            at line \(pos.line), column \(pos.column)
+            """
+
+        case .errorDuplicateTypeParameter(let names, let pos):
+            return """
+            \(code):
+            Duplicate type parameter names: \(names.joined(separator: ", "))
+            at line \(pos.line), column \(pos.column)
+            """
+
+        case .errorIncorrectNumberOfTypeArguments(let expected, let found, let pos):
+            return """
+            \(code):
+            Incorrect number of type arguments: expected \(expected), found \(found)
+            at line \(pos.line), column \(pos.column)
+            """
         }
     }
 }
@@ -426,81 +479,147 @@ typealias TypeContext = [String: Type]
 class TypeChecker {
     private var globalContext: TypeContext = [:]
 
-    // --- Stage 2 flags, read from `extend with` declarations ---
-
-    /// True when #structural-subtyping is declared; enables the subtype relation
+    // --- Stage 2 flags ---
     private var structuralSubtyping: Bool = false
-
-    /// True when #ambiguous-type-as-bottom is declared; ambiguous types default to Bot
     private var ambiguousTypeAsBottom: Bool = false
-
-    /// The declared exception type (from `exception type = T`), or nil if not declared
     private var exceptionType: Type? = nil
+
+    // --- Stage 3 flags ---
+    // typeReconstruction: enabled by #type-reconstruction — all `auto` annotations become
+    //   fresh type variables and types are inferred via unification (Hindley-Milner style).
+    // universalTypes: enabled by #universal-types — System-F style parametric polymorphism
+    //   with `generic fn`, `forall`, type abstractions, and type applications.
+    private var typeReconstruction: Bool = false
+    private var universalTypes: Bool = false
+
+    // --- Stage 3: Type reconstruction state ---
+    // substitution maps type-variable names (e.g. "?T3") to the types they've been unified with.
+    // nextTypeVarId is the counter used to generate unique fresh variable names.
+    private var substitution: [String: Type] = [:]
+    private var nextTypeVarId: Int = 0
+
+    // --- Stage 3: Universal types state ---
+    // typeVarScope holds the names of type variables currently in lexical scope (from
+    // enclosing generic fn / type-abstraction binders). Used to catch ERROR_UNDEFINED_TYPE_VARIABLE.
+    private var typeVarScope: Set<String> = []
 
     // MARK: - Entry Point
 
-    /// Performs type checking for the whole program
     func typecheck(program: Program) throws {
-        // 1. Read declared extensions and set checker flags
         let allExtNames = program.extensions.flatMap { $0.names }
         structuralSubtyping   = allExtNames.contains("#structural-subtyping")
         ambiguousTypeAsBottom = allExtNames.contains("#ambiguous-type-as-bottom")
+        typeReconstruction    = allExtNames.contains("#type-reconstruction")
+        universalTypes        = allExtNames.contains("#universal-types")
 
-        // 2. Scan top-level declarations for exception type declaration
         for decl in program.decls {
             if case .declExceptionType(let exType, _) = decl {
                 exceptionType = exType
             }
         }
 
-        // 3. Check for presence of 'main'
-        guard let mainDecl = program.decls.first(where: { decl in
-            if case .declFun(let name, _, _, _, _, _) = decl, name == "main" {
-                return true
+        // Stage 3 (#type-reconstruction): Before type-checking begins, walk the entire program
+        // and replace every occurrence of the `auto` type with a globally-unique type variable
+        // (e.g. ?T1, ?T2, …). The unification engine will then solve those variables as
+        // constraints are discovered during type-checking.
+        var processedDecls = program.decls
+        if typeReconstruction {
+            processedDecls = program.decls.map { replaceAutoInDecl($0) }
+        }
+
+        guard let mainDecl = processedDecls.first(where: { decl in
+            switch decl {
+            case .declFun(let name, _, _, _, _, _): return name == "main"
+            case .declFunGeneric(let name, _, _, _, _, _, _): return name == "main"
+            default: return false
             }
-            return false
         }) else {
             throw TypeCheckError.errorMissingMain
         }
 
-        // 4. Build global context from all function declarations
-        try buildGlobalContext(from: program.decls)
+        try buildGlobalContext(from: processedDecls)
 
-        // 5. Verify 'main' has exactly one parameter (required by Stella core)
-        guard case .declFun(_, let params, _, _, _, _) = mainDecl, params.count == 1 else {
+        switch mainDecl {
+        case .declFun(_, let params, _, _, _, _):
+            guard params.count == 1 else {
+                throw TypeCheckError.errorIncorrectTypeOfMain
+            }
+        case .declFunGeneric(_, _, let params, _, _, _, _):
+            guard params.count == 1 else {
+                throw TypeCheckError.errorIncorrectTypeOfMain
+            }
+        default:
             throw TypeCheckError.errorIncorrectTypeOfMain
         }
 
-        // 6. Type-check each declaration
-        for decl in program.decls {
+        for decl in processedDecls {
             try typecheckDecl(decl)
+        }
+    }
+
+    private func isDeclNamed(_ decl: Decl, name: String) -> Bool {
+        switch decl {
+        case .declFun(let n, _, _, _, _, _): return n == name
+        case .declFunGeneric(let n, _, _, _, _, _, _): return n == name
+        default: return false
         }
     }
 
     // MARK: - Global Context Construction
 
-    /// Populates `globalContext` with the function types of all top-level `declFun`s.
     private func buildGlobalContext(from decls: [Decl]) throws {
         for decl in decls {
-            guard case .declFun(let name, let params, let returnType, _, _, _) = decl else {
-                continue  // skip declExceptionType and any future non-function decls
-            }
+            switch decl {
+            case .declFun(let name, let params, let returnType, _, _, _):
+                let paramTypes = params.map { $0.paramType }
+                guard let retType = returnType else {
+                    fatalError("Function \(name) must have explicit return type")
+                }
+                globalContext[name] = .function(paramTypes: paramTypes, returnType: retType)
 
-            let paramTypes = params.map { $0.paramType }
-            guard let retType = returnType else {
-                fatalError("Function \(name) must have explicit return type")
+            case .declFunGeneric(let name, let typeParams, let params, let returnType, _, _, _):
+                let paramTypes = params.map { $0.paramType }
+                guard let retType = returnType else {
+                    fatalError("Generic function \(name) must have explicit return type")
+                }
+                let fnType = Type.function(paramTypes: paramTypes, returnType: retType)
+                globalContext[name] = .forAll(typeVars: typeParams, bodyType: fnType)
+
+            default:
+                continue
             }
-            globalContext[name] = .function(paramTypes: paramTypes, returnType: retType)
         }
     }
 
     // MARK: - Declaration Type Checking
 
-    /// Type-checks a single declaration.
     private func typecheckDecl(_ decl: Decl) throws {
         switch decl {
         case .declFun(let name, let params, let returnType, let localDecls, let returnExpr, let declPos):
-            // Validate declared parameter types and return type
+            // Validate explicit types unless in reconstruction mode (auto types are handled later via unification)
+            if universalTypes || !typeReconstruction {
+                for param in params {
+                    try validateType(param.paramType, at: declPos)
+                }
+                if let retType = returnType {
+                    try validateType(retType, at: declPos)
+                }
+            }
+
+            try typecheckFunctionBody(named: name, params: params, returnType: returnType,
+                                       localDecls: localDecls, returnExpr: returnExpr)
+
+        case .declFunGeneric(let name, let typeParams, let params, let returnType, let localDecls, let returnExpr, let declPos):
+            // Bring type parameters into scope for the duration of this declaration
+            let oldScope = typeVarScope
+            typeVarScope = typeVarScope.union(typeParams)
+            defer { typeVarScope = oldScope }
+
+            let dupes = findDuplicates(in: typeParams)
+            if !dupes.isEmpty {
+                throw TypeCheckError.errorDuplicateTypeParameter(names: dupes, position: declPos)
+            }
+
             for param in params {
                 try validateType(param.paramType, at: declPos)
             }
@@ -508,60 +627,95 @@ class TypeChecker {
                 try validateType(retType, at: declPos)
             }
 
-            // Build local context: global + parameters
-            var localContext = globalContext
-            for param in params {
-                localContext[param.name] = param.paramType
-            }
-
-            // Add nested local functions to context
-            for localDecl in localDecls {
-                if case .declFun(let localName, let localParams, let localRetType, _, _, _) = localDecl {
-                    let localParamTypes = localParams.map { $0.paramType }
-                    if let ret = localRetType {
-                        localContext[localName] = .function(paramTypes: localParamTypes, returnType: ret)
-                    }
-                }
-            }
-
-            // Type-check nested function declarations
-            for localDecl in localDecls {
-                try typecheckDecl(localDecl)
-            }
-
-            // Type-check the function body against the declared return type
-            guard let expectedReturnType = returnType else {
-                fatalError("Function \(name) must have explicit return type")
-            }
-            try checkExpr(returnExpr, expectedType: expectedReturnType, context: localContext)
+            try typecheckFunctionBody(named: name, params: params, returnType: returnType,
+                                       localDecls: localDecls, returnExpr: returnExpr)
 
         case .declExceptionType:
-            // Exception type declarations are processed at program level; nothing to check here
             break
         }
     }
 
+    /// Builds a local type context from params + local decl signatures, type-checks
+    /// all local declarations, then verifies the return expression against the declared return type.
+    /// Shared by both regular (declFun) and generic (declFunGeneric) function checking.
+    private func typecheckFunctionBody(
+        named name: String,
+        params: [ParamDecl],
+        returnType: Type?,
+        localDecls: [Decl],
+        returnExpr: Expr
+    ) throws {
+        var localContext = globalContext
+        for param in params {
+            localContext[param.name] = param.paramType
+        }
+
+        // Register local function signatures so they can call each other recursively
+        for localDecl in localDecls {
+            if case .declFun(let localName, let localParams, let localRetType, _, _, _) = localDecl {
+                let localParamTypes = localParams.map { $0.paramType }
+                if let ret = localRetType {
+                    localContext[localName] = .function(paramTypes: localParamTypes, returnType: ret)
+                }
+            }
+            if case .declFunGeneric(let localName, let tParams, let localParams, let localRetType, _, _, _) = localDecl {
+                let localParamTypes = localParams.map { $0.paramType }
+                if let ret = localRetType {
+                    localContext[localName] = .forAll(typeVars: tParams,
+                                                      bodyType: .function(paramTypes: localParamTypes, returnType: ret))
+                }
+            }
+        }
+
+        for localDecl in localDecls {
+            try typecheckDecl(localDecl)
+        }
+
+        guard let expectedReturnType = returnType else {
+            fatalError("Function '\(name)' must have explicit return type")
+        }
+        try checkExpr(returnExpr, expectedType: expectedReturnType, context: localContext)
+    }
+
     // MARK: - Checking Mode
 
-    /// Checks `expr` against `expectedType` in checking (top-down) mode.
-    /// This mode is used when we already know what type is expected — it gives better error messages
-    /// for structured forms like lambdas, tuples, records, etc.
+    /// Checking mode (type-directed): verify that `expr` has type compatible with `expectedType`.
+    /// In reconstruction mode the expected type is first fully resolved through the current
+    /// substitution; if it is still a free type variable the expression is inferred instead and the
+    /// variable is unified with the inferred type (constraint generation).
     private func checkExpr(_ expr: Expr, expectedType: Type, context: TypeContext) throws {
-        switch (expr, expectedType) {
+        let expected: Type
+        if typeReconstruction {
+            let resolved = resolveType(expectedType)
+            if case .typeVar(_) = resolved {
+                // Expected is still unknown — infer the expression and record the constraint
+                let inferred = try inferType(expr, context: context)
+                try unify(resolved, inferred, expr: expr)
+                return
+            }
+            expected = resolved
+        } else {
+            expected = expectedType
+        }
+
+        switch (expr, expected) {
 
         // === Lambda against function type ===
         case (.abstraction(let params, let body, _), .function(let expectedParamTypes, let expectedReturnType)):
             guard params.count == expectedParamTypes.count else {
                 throw TypeCheckError.errorUnexpectedTypeForExpression(
-                    expected: expectedType,
+                    expected: expected,
                     found: .function(paramTypes: params.map { $0.paramType }, returnType: .nat),
                     expr: expr
                 )
             }
 
-            for (param, expectedParamType) in zip(params, expectedParamTypes) {
-                if structuralSubtyping {
-                    // Contravariance: expectedParamType must be a subtype of the declared param type
+            if typeReconstruction {
+                for (param, expectedParamType) in zip(params, expectedParamTypes) {
+                    try unify(param.paramType, expectedParamType, expr: expr)
+                }
+            } else if structuralSubtyping {
+                for (param, expectedParamType) in zip(params, expectedParamTypes) {
                     if !isSubtype(expectedParamType, param.paramType) {
                         if case .record(let paramFields) = param.paramType,
                            case .record(_) = expectedParamType {
@@ -582,10 +736,12 @@ class TypeChecker {
                             returnType: expectedReturnType
                         )
                         throw TypeCheckError.errorUnexpectedSubtype(
-                            expected: expectedType, found: inferredFnType, expr: expr
+                            expected: expected, found: inferredFnType, expr: expr
                         )
                     }
-                } else {
+                }
+            } else {
+                for (param, expectedParamType) in zip(params, expectedParamTypes) {
                     if param.paramType != expectedParamType {
                         throw TypeCheckError.errorUnexpectedTypeForParameter(
                             expected: expectedParamType,
@@ -603,10 +759,8 @@ class TypeChecker {
             try checkExpr(body, expectedType: expectedReturnType, context: bodyContext)
 
         // === Tuple against tuple type ===
-        // With structural subtyping, a tuple with MORE elements is a subtype (width subtyping).
         case (.tuple(let exprs, let pos), .tuple(let expectedTypes)):
             if structuralSubtyping {
-                // A longer tuple is a subtype of a shorter one; require at least as many elements
                 guard exprs.count >= expectedTypes.count else {
                     throw TypeCheckError.errorUnexpectedTupleLength(
                         expected: expectedTypes.count, found: exprs.count, position: pos
@@ -627,7 +781,6 @@ class TypeChecker {
             }
 
         // === Record against record type ===
-        // With structural subtyping, extra fields are allowed (width subtyping for records).
         case (.record(let bindings, let pos), .record(let expectedFields)):
             let bindingNames = bindings.map { $0.name }
             let duplicates = findDuplicates(in: bindingNames)
@@ -638,15 +791,6 @@ class TypeChecker {
             let providedLabels = Set(bindings.map { $0.name })
             let expectedLabels = Set(expectedFields.map { $0.label })
 
-            // Missing fields are always an error regardless of subtyping
-            let missing = expectedLabels.subtracting(providedLabels)
-            if !missing.isEmpty {
-                throw TypeCheckError.errorMissingRecordFields(
-                    missing: Array(missing).sorted(), position: pos
-                )
-            }
-
-            // Unexpected fields are only an error without structural subtyping
             if !structuralSubtyping {
                 let unexpected = providedLabels.subtracting(expectedLabels)
                 if !unexpected.isEmpty {
@@ -656,11 +800,15 @@ class TypeChecker {
                 }
             }
 
-            // Check that each expected field has the right type
+            let missing = expectedLabels.subtracting(providedLabels)
+            if !missing.isEmpty {
+                throw TypeCheckError.errorMissingRecordFields(
+                    missing: Array(missing).sorted(), position: pos
+                )
+            }
+
             for binding in bindings {
                 guard let expectedField = expectedFields.first(where: { $0.label == binding.name }) else {
-                    // Extra field (only reached when structural subtyping is on);
-                    // just validate the expression itself without a specific expected type
                     _ = try inferType(binding.rhs, context: context)
                     continue
                 }
@@ -690,147 +838,219 @@ class TypeChecker {
         case (.variant(let label, let exprOpt, let pos), .variant(let fields)):
             guard let field = fields.first(where: { $0.label == label }) else {
                 throw TypeCheckError.errorUnexpectedVariantLabel(
-                    label: label, variantType: expectedType, position: pos
+                    label: label, variantType: expected, position: pos
                 )
             }
             switch (exprOpt, field.fieldType) {
             case (nil, nil):
-                break  // nullary variant — OK
+                break
             case (let innerExpr?, let fieldType?):
                 try checkExpr(innerExpr, expectedType: fieldType, context: context)
             case (nil, _?):
                 throw TypeCheckError.errorUnexpectedTypeForExpression(
-                    expected: expectedType, found: expectedType, expr: expr
+                    expected: expected, found: expected, expr: expr
                 )
             case (_?, nil):
                 throw TypeCheckError.errorUnexpectedTypeForExpression(
-                    expected: expectedType, found: expectedType, expr: expr
+                    expected: expected, found: expected, expr: expr
                 )
             }
 
-        // === panic! — a diverging expression, valid at any expected type ===
+        // === panic! ===
         case (.panic_(_), _):
-            break  // panic! is bottom-typed; always accepted in any checking context
+            break
 
-        // === throw(e) — check e has the exception type; result can be any type ===
+        // === throw(e) ===
         case (.throw_(let innerExpr, let pos), _):
             guard let excType = exceptionType else {
                 throw TypeCheckError.errorExceptionTypeNotDeclared(position: pos)
             }
             try checkExpr(innerExpr, expectedType: excType, context: context)
-            // throw never returns, so any return type is satisfied
 
         // === new(e) against &T ===
         case (.newRef(let innerExpr, _), .ref(let innerType)):
             try checkExpr(innerExpr, expectedType: innerType, context: context)
 
-        // === new(e) against a non-reference type — error ===
+        // === new(e) against a non-reference type ===
         case (.newRef(_, let pos), _):
-            throw TypeCheckError.errorUnexpectedReference(expected: expectedType, position: pos)
+            throw TypeCheckError.errorUnexpectedReference(expected: expected, position: pos)
 
-        // === @address against &T — valid memory address literal ===
+        // === @address against &T ===
         case (.constMemory, .ref):
-            break  // memory address is valid wherever a reference type is expected
+            break
 
-        // === @address against a non-reference type — error ===
+        // === @address against a non-reference type ===
         case (.constMemory(_, let pos), _):
-            throw TypeCheckError.errorUnexpectedMemoryAddress(expected: expectedType, position: pos)
+            throw TypeCheckError.errorUnexpectedMemoryAddress(expected: expected, position: pos)
 
-        // === Propagate expected type through if-then-else ===
-        // Both branches are checked against the known expected type.
-        // This allows diverging expressions like `panic!` and `throw` in branches.
+        // === if-then-else ===
         case (.ifExpr(let condition, let thenExpr, let elseExpr, _), _):
             try checkExpr(condition, expectedType: .bool, context: context)
-            try checkExpr(thenExpr, expectedType: expectedType, context: context)
-            try checkExpr(elseExpr, expectedType: expectedType, context: context)
+            try checkExpr(thenExpr, expectedType: expected, context: context)
+            try checkExpr(elseExpr, expectedType: expected, context: context)
 
-        // === Propagate expected type through let bindings ===
+        // === let bindings ===
         case (.letExpr(let bindings, let body, _), _):
             var newContext = context
             for binding in bindings {
                 let rhsType = try inferType(binding.rhs, context: newContext)
                 try bindPattern(binding.pattern, to: rhsType, context: &newContext)
             }
-            try checkExpr(body, expectedType: expectedType, context: newContext)
+            try checkExpr(body, expectedType: expected, context: newContext)
 
-        // === Propagate expected type through match ===
+        // === match ===
         case (.match(let scrutinee, let cases, let pos), _):
             if cases.isEmpty {
                 throw TypeCheckError.errorIllegalEmptyMatching(position: pos)
             }
             let scrutineeType = try inferType(scrutinee, context: context)
+            let resolvedScrutineeType = typeReconstruction ? resolveType(scrutineeType) : scrutineeType
             for matchCase in cases {
                 var caseContext = context
-                try checkPattern(matchCase.pattern, against: scrutineeType, context: &caseContext)
-                try checkExpr(matchCase.expr, expectedType: expectedType, context: caseContext)
+                try checkPattern(matchCase.pattern, against: resolvedScrutineeType, context: &caseContext)
+                try checkExpr(matchCase.expr, expectedType: expected, context: caseContext)
             }
-            try checkExhaustiveness(patterns: cases.map { $0.pattern }, against: scrutineeType, position: pos)
+            try checkExhaustiveness(patterns: cases.map { $0.pattern }, against: resolvedScrutineeType, position: pos)
 
-        // === Propagate expected type through parentheses ===
+        // === parenthesised ===
         case (.parenthesised(let innerExpr, _), _):
-            try checkExpr(innerExpr, expectedType: expectedType, context: context)
+            try checkExpr(innerExpr, expectedType: expected, context: context)
 
-        // === Propagate expected type through dereference ===
-        // *e checked against T means e must have type &T
+        // === dereference ===
         case (.deref(let innerExpr, _), _):
-            try checkExpr(innerExpr, expectedType: .ref(expectedType), context: context)
+            try checkExpr(innerExpr, expectedType: .ref(expected), context: context)
 
-        // === Propagate expected type through try-with ===
+        // === try-with ===
         case (.tryWith(let tryExpr, let fallback, _), _):
-            try checkExpr(tryExpr, expectedType: expectedType, context: context)
-            try checkExpr(fallback, expectedType: expectedType, context: context)
+            try checkExpr(tryExpr, expectedType: expected, context: context)
+            try checkExpr(fallback, expectedType: expected, context: context)
 
-        // === Propagate expected type through try-catch ===
+        // === try-catch ===
         case (.tryCatch(let tryExpr, let pat, let fallback, let pos), _):
             guard let excType = exceptionType else {
                 throw TypeCheckError.errorExceptionTypeNotDeclared(position: pos)
             }
-            try checkExpr(tryExpr, expectedType: expectedType, context: context)
+            try checkExpr(tryExpr, expectedType: expected, context: context)
             var catchContext = context
             try checkPattern(pat, against: excType, context: &catchContext)
-            try checkExpr(fallback, expectedType: expectedType, context: catchContext)
+            try checkExpr(fallback, expectedType: expected, context: catchContext)
 
-        // === Propagate expected type through sequence ===
+        // === sequence ===
         case (.sequence(let e1, let e2, _), _):
             try checkExpr(e1, expectedType: .unit, context: context)
-            try checkExpr(e2, expectedType: expectedType, context: context)
+            try checkExpr(e2, expectedType: expected, context: context)
 
-        // === Specific structural-mismatch errors (must come before fallback default) ===
+        // === Type abstraction (generic [X] body) checked against forall X. T ===
+        // Rename expected bound variables to match actual binder names, then check the body.
+        // If the same name was already in scope (shadowing), alpha-rename the outer occurrence
+        // in the context so inner and outer variables stay distinct.
+        case (.typeAbstraction(let typeVars, let body, _), .forAll(let expectedTypeVars, let expectedBodyType)):
+            let oldScope = typeVarScope
+            typeVarScope = typeVarScope.union(typeVars)
+            defer { typeVarScope = oldScope }
+
+            var mapping: [String: Type] = [:]
+            for (tv, ev) in zip(typeVars, expectedTypeVars) {
+                mapping[ev] = .typeVar(name: tv)
+            }
+            let renamedBodyType = substituteTypeVars(in: expectedBodyType, mapping: mapping)
+
+            let shadowedVars = typeVars.filter { oldScope.contains($0) }
+            var newContext = context
+            if !shadowedVars.isEmpty {
+                var outerRenaming: [String: Type] = [:]
+                for sv in shadowedVars {
+                    let fresh = "__outer_\(sv)_\(nextTypeVarId)"
+                    nextTypeVarId += 1
+                    outerRenaming[sv] = .typeVar(name: fresh)
+                }
+                for (key, value) in newContext {
+                    newContext[key] = substituteTypeVars(in: value, mapping: outerRenaming)
+                }
+            }
+
+            try checkExpr(body, expectedType: renamedBodyType, context: newContext)
+
+        // === Structural mismatch errors ===
+        // In reconstruction mode, infer and unify instead of throwing structural errors
 
         case (.abstraction(_, _, let pos), _):
-            throw TypeCheckError.errorUnexpectedLambda(expected: expectedType, position: pos)
+            if typeReconstruction {
+                let inferred = try inferType(expr, context: context)
+                try unify(inferred, expected, expr: expr)
+                return
+            }
+            throw TypeCheckError.errorUnexpectedLambda(expected: expected, position: pos)
 
         case (.tuple(_, let pos), _):
-            throw TypeCheckError.errorUnexpectedTuple(expected: expectedType, position: pos)
+            if typeReconstruction {
+                let inferred = try inferType(expr, context: context)
+                try unify(inferred, expected, expr: expr)
+                return
+            }
+            throw TypeCheckError.errorUnexpectedTuple(expected: expected, position: pos)
 
         case (.record(_, let pos), _):
-            throw TypeCheckError.errorUnexpectedRecord(expected: expectedType, position: pos)
+            if typeReconstruction {
+                let inferred = try inferType(expr, context: context)
+                try unify(inferred, expected, expr: expr)
+                return
+            }
+            throw TypeCheckError.errorUnexpectedRecord(expected: expected, position: pos)
 
         case (.inl(_, let pos), _):
-            throw TypeCheckError.errorUnexpectedInjection(expected: expectedType, position: pos)
+            if typeReconstruction {
+                let inferred = try inferType(expr, context: context)
+                try unify(inferred, expected, expr: expr)
+                return
+            }
+            throw TypeCheckError.errorUnexpectedInjection(expected: expected, position: pos)
 
         case (.inr(_, let pos), _):
-            throw TypeCheckError.errorUnexpectedInjection(expected: expectedType, position: pos)
+            if typeReconstruction {
+                let inferred = try inferType(expr, context: context)
+                try unify(inferred, expected, expr: expr)
+                return
+            }
+            throw TypeCheckError.errorUnexpectedInjection(expected: expected, position: pos)
 
         case (.list(_, let pos), _):
-            throw TypeCheckError.errorUnexpectedList(expected: expectedType, position: pos)
+            if typeReconstruction {
+                let inferred = try inferType(expr, context: context)
+                try unify(inferred, expected, expr: expr)
+                return
+            }
+            throw TypeCheckError.errorUnexpectedList(expected: expected, position: pos)
 
         case (.consList(_, _, let pos), _):
-            throw TypeCheckError.errorUnexpectedList(expected: expectedType, position: pos)
+            if typeReconstruction {
+                let inferred = try inferType(expr, context: context)
+                try unify(inferred, expected, expr: expr)
+                return
+            }
+            throw TypeCheckError.errorUnexpectedList(expected: expected, position: pos)
 
         case (.variant(_, _, let pos), _):
-            throw TypeCheckError.errorUnexpectedVariant(expected: expectedType, position: pos)
+            if typeReconstruction {
+                let inferred = try inferType(expr, context: context)
+                try unify(inferred, expected, expr: expr)
+                return
+            }
+            throw TypeCheckError.errorUnexpectedVariant(expected: expected, position: pos)
 
-        // === Fallback: synthesize type and compare (with or without subtyping) ===
+        // === Fallback: synthesize type and compare ===
         default:
             let inferredType = try inferType(expr, context: context)
-            try expectType(inferredType, toBeSubtypeOf: expectedType, expr: expr)
+            if typeReconstruction {
+                try unify(inferredType, expected, expr: expr)
+            } else {
+                try expectType(inferredType, toBeSubtypeOf: expected, expr: expr)
+            }
         }
     }
 
     // MARK: - Synthesis Mode
 
-    /// Infers (synthesizes) the type of `expr` bottom-up.
     private func inferType(_ expr: Expr, context: TypeContext) throws -> Type {
         switch expr {
 
@@ -862,7 +1082,20 @@ class TypeChecker {
             return .function(paramTypes: params.map { $0.paramType }, returnType: returnType)
 
         case .application(let fun, let args, _):
-            let funType = try inferType(fun, context: context)
+            var funType = try inferType(fun, context: context)
+
+            if typeReconstruction {
+                funType = resolveType(funType)
+                if case .typeVar(_) = funType {
+                    let freshParams = args.map { _ in freshTypeVar() }
+                    let freshReturn = freshTypeVar()
+                    try unify(funType, .function(paramTypes: freshParams, returnType: freshReturn), expr: fun)
+                    for (arg, paramType) in zip(args, freshParams) {
+                        try checkExpr(arg, expectedType: paramType, context: context)
+                    }
+                    return freshReturn
+                }
+            }
 
             guard case .function(let paramTypes, let returnType) = funType else {
                 throw TypeCheckError.errorNotAFunction(expr: fun, actualType: funType)
@@ -900,7 +1133,6 @@ class TypeChecker {
         case .natRec(let n, let initial, let step, _):
             try checkExpr(n, expectedType: .nat, context: context)
             let initialType = try inferType(initial, context: context)
-            // step : Nat → (T → T)  (curried)
             let expectedStepType = Type.function(
                 paramTypes: [.nat],
                 returnType: .function(paramTypes: [initialType], returnType: initialType)
@@ -914,7 +1146,15 @@ class TypeChecker {
             return .tuple(types)
 
         case .dotTuple(let tupleExpr, let index, let pos):
-            let tupleType = try inferType(tupleExpr, context: context)
+            var tupleType = try inferType(tupleExpr, context: context)
+            if typeReconstruction {
+                tupleType = resolveType(tupleType)
+                if case .typeVar(_) = tupleType {
+                    let tupleTypes = (0..<index).map { _ in freshTypeVar() }
+                    try unify(tupleType, .tuple(tupleTypes), expr: tupleExpr)
+                    return tupleTypes[index - 1]
+                }
+            }
             guard case .tuple(let types) = tupleType else {
                 throw TypeCheckError.errorNotATuple(expr: tupleExpr, actualType: tupleType)
             }
@@ -923,7 +1163,7 @@ class TypeChecker {
                     index: index, tupleSize: types.count, position: pos
                 )
             }
-            return types[index - 1]  // Stella tuple indices are 1-based
+            return types[index - 1]
 
         // ---- Records ----
         case .record(let bindings, let pos):
@@ -940,7 +1180,15 @@ class TypeChecker {
             return .record(fields)
 
         case .dotRecord(let recordExpr, let label, let pos):
-            let recordType = try inferType(recordExpr, context: context)
+            var recordType = try inferType(recordExpr, context: context)
+            if typeReconstruction {
+                recordType = resolveType(recordType)
+                if case .typeVar(_) = recordType {
+                    let fieldType = freshTypeVar()
+                    try unify(recordType, .record([RecordFieldType(label: label, fieldType: fieldType)]), expr: recordExpr)
+                    return fieldType
+                }
+            }
             guard case .record(let fields) = recordType else {
                 throw TypeCheckError.errorNotARecord(expr: recordExpr, actualType: recordType)
             }
@@ -953,7 +1201,9 @@ class TypeChecker {
 
         // ---- Type ascription ----
         case .typeAsc(let innerExpr, let type, let pos):
-            try validateType(type, at: pos)
+            if !typeReconstruction {
+                try validateType(type, at: pos)
+            }
             try checkExpr(innerExpr, expectedType: type, context: context)
             return type
 
@@ -967,20 +1217,14 @@ class TypeChecker {
             return try inferType(body, context: newContext)
 
         case .letRec(let bindings, let body, _):
-            // letRec: treat like letExpr but with mutual recursion support.
-            // Pre-populate context with function types where possible so recursive calls resolve.
             var newContext = context
             for binding in bindings {
                 if case .abstraction(let params, _, _) = binding.rhs,
                    case .patternVar(let name, _) = binding.pattern {
-                    // Create a placeholder type from the declared param types;
-                    // the return type is inferred on a second pass below.
                     let paramTypes = params.map { $0.paramType }
-                    // Use Bot as a placeholder for return type during the recursive pre-pass
-                    newContext[name] = .function(paramTypes: paramTypes, returnType: .bot)
+                    newContext[name] = .function(paramTypes: paramTypes, returnType: typeReconstruction ? freshTypeVar() : .bot)
                 }
             }
-            // Now infer proper types and update context
             for binding in bindings {
                 let rhsType = try inferType(binding.rhs, context: newContext)
                 try bindPattern(binding.pattern, to: rhsType, context: &newContext)
@@ -989,7 +1233,17 @@ class TypeChecker {
 
         // ---- Fixpoint ----
         case .fix(let f, _):
-            let fType = try inferType(f, context: context)
+            var fType = try inferType(f, context: context)
+            if typeReconstruction {
+                fType = resolveType(fType)
+                if case .typeVar(_) = fType {
+                    let paramT = freshTypeVar()
+                    let retT = freshTypeVar()
+                    try unify(fType, .function(paramTypes: [paramT], returnType: retT), expr: f)
+                    try unify(paramT, retT, expr: expr)
+                    return resolveType(retT)
+                }
+            }
             guard case .function(let paramTypes, let returnType) = fType else {
                 throw TypeCheckError.errorNotAFunction(expr: f, actualType: fType)
             }
@@ -999,7 +1253,10 @@ class TypeChecker {
                     found: fType, expr: expr
                 )
             }
-            // fix requires f : T → T (param type must equal return type)
+            if typeReconstruction {
+                try unify(paramTypes[0], returnType, expr: expr)
+                return resolveType(returnType)
+            }
             if paramTypes[0] != returnType {
                 throw TypeCheckError.errorUnexpectedTypeForExpression(
                     expected: .function(paramTypes: [returnType], returnType: returnType),
@@ -1011,6 +1268,7 @@ class TypeChecker {
         // ---- Lists ----
         case .list(let exprs, let pos):
             if exprs.isEmpty {
+                if typeReconstruction { return .list(freshTypeVar()) }
                 if ambiguousTypeAsBottom { return .list(.bot) }
                 throw TypeCheckError.errorAmbiguousListType(position: pos)
             }
@@ -1026,21 +1284,45 @@ class TypeChecker {
             return .list(headType)
 
         case .head(let list, _):
-            let listType = try inferType(list, context: context)
+            var listType = try inferType(list, context: context)
+            if typeReconstruction {
+                listType = resolveType(listType)
+                if case .typeVar(_) = listType {
+                    let elemType = freshTypeVar()
+                    try unify(listType, .list(elemType), expr: list)
+                    return elemType
+                }
+            }
             guard case .list(let elemType) = listType else {
                 throw TypeCheckError.errorNotAList(expr: list, actualType: listType)
             }
             return elemType
 
         case .tail(let list, _):
-            let listType = try inferType(list, context: context)
+            var listType = try inferType(list, context: context)
+            if typeReconstruction {
+                listType = resolveType(listType)
+                if case .typeVar(_) = listType {
+                    let elemType = freshTypeVar()
+                    try unify(listType, .list(elemType), expr: list)
+                    return .list(elemType)
+                }
+            }
             guard case .list(_) = listType else {
                 throw TypeCheckError.errorNotAList(expr: list, actualType: listType)
             }
             return listType
 
         case .isEmpty(let list, _):
-            let listType = try inferType(list, context: context)
+            var listType = try inferType(list, context: context)
+            if typeReconstruction {
+                listType = resolveType(listType)
+                if case .typeVar(_) = listType {
+                    let elemType = freshTypeVar()
+                    try unify(listType, .list(elemType), expr: list)
+                    return .bool
+                }
+            }
             guard case .list(_) = listType else {
                 throw TypeCheckError.errorNotAList(expr: list, actualType: listType)
             }
@@ -1050,40 +1332,45 @@ class TypeChecker {
         case .match(let scrutinee, let cases, let pos):
             if cases.isEmpty { throw TypeCheckError.errorIllegalEmptyMatching(position: pos) }
             let scrutineeType = try inferType(scrutinee, context: context)
+            let resolvedScrutineeType = typeReconstruction ? resolveType(scrutineeType) : scrutineeType
 
-            // Type-check the first case to determine the result type
             let firstCase = cases[0]
             var firstContext = context
-            try checkPattern(firstCase.pattern, against: scrutineeType, context: &firstContext)
+            try checkPattern(firstCase.pattern, against: resolvedScrutineeType, context: &firstContext)
             let resultType = try inferType(firstCase.expr, context: firstContext)
 
-            // Remaining cases must produce the same result type
             for case_ in cases.dropFirst() {
                 var caseContext = context
-                try checkPattern(case_.pattern, against: scrutineeType, context: &caseContext)
+                try checkPattern(case_.pattern, against: resolvedScrutineeType, context: &caseContext)
                 try checkExpr(case_.expr, expectedType: resultType, context: caseContext)
             }
-            try checkExhaustiveness(patterns: cases.map { $0.pattern }, against: scrutineeType, position: pos)
+            try checkExhaustiveness(patterns: cases.map { $0.pattern }, against: resolvedScrutineeType, position: pos)
             return resultType
 
-        // ---- Sum types — require context to infer ----
+        // ---- Sum types ----
         case .inl(let innerExpr, let pos):
+            if typeReconstruction {
+                let innerType = try inferType(innerExpr, context: context)
+                return .sum(left: innerType, right: freshTypeVar())
+            }
             if ambiguousTypeAsBottom {
-                // Without context, the missing (right) side defaults to Bot: inl(e) : T + Bot
                 let innerType = try inferType(innerExpr, context: context)
                 return .sum(left: innerType, right: .bot)
             }
             throw TypeCheckError.errorAmbiguousSumType(position: pos)
 
         case .inr(let innerExpr, let pos):
+            if typeReconstruction {
+                let innerType = try inferType(innerExpr, context: context)
+                return .sum(left: freshTypeVar(), right: innerType)
+            }
             if ambiguousTypeAsBottom {
-                // Without context, the missing (left) side defaults to Bot: inr(e) : Bot + T
                 let innerType = try inferType(innerExpr, context: context)
                 return .sum(left: .bot, right: innerType)
             }
             throw TypeCheckError.errorAmbiguousSumType(position: pos)
 
-        // ---- Variants — require context ----
+        // ---- Variants ----
         case .variant(_, _, let pos):
             throw TypeCheckError.errorAmbiguousVariantType(position: pos)
 
@@ -1091,66 +1378,70 @@ class TypeChecker {
         case .parenthesised(let innerExpr, _):
             return try inferType(innerExpr, context: context)
 
-        // ---- Sequencing (#sequencing): e1 ; e2  ----
-        // e1 must be Unit, the result is the type of e2
+        // ---- Sequencing ----
         case .sequence(let e1, let e2, _):
             try checkExpr(e1, expectedType: .unit, context: context)
             return try inferType(e2, context: context)
 
-        // ---- References (#references) ----
-
-        /// new(e) — allocate a fresh reference cell containing a value of type T
+        // ---- References ----
         case .newRef(let innerExpr, _):
             let innerType = try inferType(innerExpr, context: context)
             return .ref(innerType)
 
-        /// *e — dereference: e must have type &T, result is T
         case .deref(let innerExpr, let pos):
-            let innerType = try inferType(innerExpr, context: context)
+            var innerType = try inferType(innerExpr, context: context)
+            if typeReconstruction {
+                innerType = resolveType(innerType)
+                let refInner = freshTypeVar()
+                try unify(innerType, .ref(refInner), expr: innerExpr)
+                return resolveType(refInner)
+            }
             guard case .ref(let refInnerType) = innerType else {
                 throw TypeCheckError.errorNotAReference(expr: innerExpr, actualType: innerType, position: pos)
             }
             return refInnerType
 
-        /// lhs := rhs — assignment: lhs must be &T, rhs must be T, result is Unit
         case .assign(let lhs, let rhs, let pos):
-            let lhsType = try inferType(lhs, context: context)
+            var lhsType = try inferType(lhs, context: context)
+            if typeReconstruction {
+                lhsType = resolveType(lhsType)
+                let refInner = freshTypeVar()
+                try unify(lhsType, .ref(refInner), expr: lhs)
+                try checkExpr(rhs, expectedType: refInner, context: context)
+                return .unit
+            }
             guard case .ref(let refInnerType) = lhsType else {
                 throw TypeCheckError.errorNotAReference(expr: lhs, actualType: lhsType, position: pos)
             }
             try checkExpr(rhs, expectedType: refInnerType, context: context)
             return .unit
 
-        /// @address — memory address literal in synthesis mode
         case .constMemory(_, let pos):
+            if typeReconstruction { return .ref(freshTypeVar()) }
             if ambiguousTypeAsBottom { return .ref(.bot) }
             throw TypeCheckError.errorAmbiguousReferenceType(position: pos)
 
-        // ---- Panic (#panic) ----
-
-        /// panic! in synthesis mode — type is ambiguous
+        // ---- Panic ----
         case .panic_(let pos):
+            if typeReconstruction { return freshTypeVar() }
             if ambiguousTypeAsBottom { return .bot }
             throw TypeCheckError.errorAmbiguousPanicType(position: pos)
 
-        // ---- Exceptions (#exceptions) ----
-
-        /// throw(e) — check e against the declared exception type, result is Bottom
+        // ---- Exceptions ----
         case .throw_(let innerExpr, let pos):
             guard let excType = exceptionType else {
                 throw TypeCheckError.errorExceptionTypeNotDeclared(position: pos)
             }
             try checkExpr(innerExpr, expectedType: excType, context: context)
+            if typeReconstruction { return freshTypeVar() }
             if ambiguousTypeAsBottom { return .bot }
             throw TypeCheckError.errorAmbiguousThrowType(position: pos)
 
-        /// try { e1 } with { e2 } — both branches must have the same type
         case .tryWith(let tryExpr, let fallback, _):
             let tryType = try inferType(tryExpr, context: context)
             try checkExpr(fallback, expectedType: tryType, context: context)
             return tryType
 
-        /// try { e1 } catch { pat => e2 } — pat binds exception value
         case .tryCatch(let tryExpr, let pat, let fallback, let pos):
             guard let excType = exceptionType else {
                 throw TypeCheckError.errorExceptionTypeNotDeclared(position: pos)
@@ -1161,12 +1452,10 @@ class TypeChecker {
             try checkExpr(fallback, expectedType: tryType, context: catchContext)
             return tryType
 
-        // ---- Type cast (#type-cast) ----
-
-        /// e cast as T — result type is always T (runtime check; static checker just returns T)
+        // ---- Type cast ----
         case .typeCast(let innerExpr, let type, let pos):
             try validateType(type, at: pos)
-            _ = try inferType(innerExpr, context: context)  // validate inner expr is well-typed
+            _ = try inferType(innerExpr, context: context)
             return type
 
         // ---- Arithmetic operators ----
@@ -1197,66 +1486,82 @@ class TypeChecker {
             let leftType = try inferType(l, context: context)
             try checkExpr(r, expectedType: leftType, context: context)
             return .bool
+
+        // ---- Stage 3: Universal types (#universal-types) ----
+
+        // generic [X] body  →  infer body type with X in scope, return forall X. bodyType
+        case .typeAbstraction(let typeVars, let body, _):
+            let oldScope = typeVarScope
+            typeVarScope = typeVarScope.union(typeVars)
+            defer { typeVarScope = oldScope }
+            let bodyType = try inferType(body, context: context)
+            return .forAll(typeVars: typeVars, bodyType: bodyType)
+
+        // expr[T]  →  expr must have type forall X. S; substitute X := T throughout S
+        // ERROR_NOT_A_GENERIC_FUNCTION is raised before inspecting the type argument.
+        case .typeApplication(let innerExpr, let typeArgs, let pos):
+            let innerType = try inferType(innerExpr, context: context)
+            guard case .forAll(let typeParams, let bodyType) = innerType else {
+                throw TypeCheckError.errorNotAGenericFunction(expr: innerExpr, actualType: innerType, position: pos)
+            }
+            guard typeArgs.count == typeParams.count else {
+                throw TypeCheckError.errorIncorrectNumberOfTypeArguments(
+                    expected: typeParams.count, found: typeArgs.count, position: pos
+                )
+            }
+            for typeArg in typeArgs {
+                try validateType(typeArg, at: pos)
+            }
+            var mapping: [String: Type] = [:]
+            for (param, arg) in zip(typeParams, typeArgs) {
+                mapping[param] = arg
+            }
+            // Capture-avoiding substitution is handled inside substituteTypeVars
+            return substituteTypeVars(in: bodyType, mapping: mapping)
         }
     }
 
     // MARK: - Subtyping
 
-    /// Returns true if `s` is a subtype of `t` under the current subtyping rules.
-    /// When `structuralSubtyping` is false, only reflexivity (s == t) applies.
-    /// When true, the full structural subtype relation from TaPL §15 is used.
     private func isSubtype(_ s: Type, _ t: Type) -> Bool {
-        // Reflexivity — always holds
         if s == t { return true }
 
         if !structuralSubtyping {
             return false
         }
 
-        // Bot <: T for all T (Bot is the bottom type, never instantiated at runtime)
         if case .bot = s { return true }
-        // T <: Top for all T (Top is the supertype of everything)
         if case .top = t { return true }
 
         switch (s, t) {
-        // S-Arrow: (S1 → S2) <: (T1 → T2)  iff  T1 <: S1  and  S2 <: T2
-        // Parameters are CONTRAVARIANT; return type is COVARIANT
         case (.function(let sParams, let sRet), .function(let tParams, let tRet)):
             guard sParams.count == tParams.count else { return false }
-            let paramsOk = zip(sParams, tParams).allSatisfy { isSubtype($1, $0) }  // note reversed order
+            let paramsOk = zip(sParams, tParams).allSatisfy { isSubtype($1, $0) }
             return paramsOk && isSubtype(sRet, tRet)
 
-        // S-RcdWidth/Depth: {li:Si,...} <: {lj:Tj} when all lj appear in {li} with Si <: Tj
-        // A record with MORE fields is a subtype (the extra fields can be ignored by the consumer)
         case (.record(let sFields), .record(let tFields)):
             for tField in tFields {
                 guard let sField = sFields.first(where: { $0.label == tField.label }) else {
-                    return false  // required field missing
+                    return false
                 }
                 if !isSubtype(sField.fieldType, tField.fieldType) { return false }
             }
             return true
 
-        // S-TupleDepth: {S1,...,Sn} <: {T1,...,Tn} when each Si <: Ti (positional)
-        // Width subtyping: {S1,...,Sn,Sn+1,...} <: {T1,...,Sn} (can ignore extra elements)
         case (.tuple(let sTypes), .tuple(let tTypes)):
             guard sTypes.count >= tTypes.count else { return false }
             return zip(sTypes, tTypes).allSatisfy { isSubtype($0, $1) }
 
-        // S-SumType: (S1 + S2) <: (T1 + T2) when S1 <: T1 and S2 <: T2 (covariant)
         case (.sum(let sL, let sR), .sum(let tL, let tR)):
             return isSubtype(sL, tL) && isSubtype(sR, tR)
 
-        // S-List: [S] <: [T] when S <: T (covariant)
         case (.list(let sElem), .list(let tElem)):
             return isSubtype(sElem, tElem)
 
-        // S-Variant: <|S-labels|> <: <|T-labels|> when S labels ⊆ T labels with Si <: Ti
-        // A variant with FEWER labels is a subtype (every S value is also a valid T value)
         case (.variant(let sFields), .variant(let tFields)):
             for sField in sFields {
                 guard let tField = tFields.first(where: { $0.label == sField.label }) else {
-                    return false  // S has a label not present in T
+                    return false
                 }
                 switch (sField.fieldType, tField.fieldType) {
                 case (nil, nil): break
@@ -1266,7 +1571,6 @@ class TypeChecker {
             }
             return true
 
-        // S-Ref: &S <: &T iff S == T (references are INVARIANT — read and write)
         case (.ref(let sInner), .ref(let tInner)):
             return isSubtype(sInner, tInner) && isSubtype(tInner, sInner)
 
@@ -1277,8 +1581,6 @@ class TypeChecker {
 
     // MARK: - Helper: expectType
 
-    /// Checks that `found` is a subtype of (or equal to) `expected`.
-    /// Raises the appropriate error if not.
     private func expectType(_ found: Type, toBeSubtypeOf expected: Type, expr: Expr) throws {
         if structuralSubtyping {
             if !isSubtype(found, expected) {
@@ -1286,7 +1588,6 @@ class TypeChecker {
             }
         } else {
             if found != expected {
-                // Produce a specific error for variant label mismatches before the generic one
                 if case .variant(let inferredFields) = found,
                    case .variant(let expectedFields) = expected {
                     let inferredLabels = Set(inferredFields.map { $0.label })
@@ -1307,11 +1608,88 @@ class TypeChecker {
 
     // MARK: - Pattern Checking
 
-    /// Validates that `pattern` is compatible with `type` and adds bound variables to `context`.
+    private func unifyForPattern(_ t1: Type, _ t2: Type, position: SourcePosition) throws {
+        let r1 = resolveType(t1)
+        let r2 = resolveType(t2)
+        if r1 == r2 { return }
+        let dummyExpr = Expr.constUnit(position)
+        try unify(r1, r2, expr: dummyExpr)
+    }
+
     private func checkPattern(_ pattern: Pattern, against type: Type, context: inout TypeContext) throws {
-        switch (pattern, type) {
+        let resolvedType = typeReconstruction ? resolveType(type) : type
+
+        // In reconstruction mode, handle patterns against type variables via unification
+        if typeReconstruction, case .typeVar(_) = resolvedType {
+            switch pattern {
+            case .patternVar(let name, _):
+                context[name] = resolvedType
+                return
+            case .patternInl(let innerPattern, _):
+                let leftType = freshTypeVar()
+                let rightType = freshTypeVar()
+                try unifyForPattern(resolvedType, .sum(left: leftType, right: rightType), position: pattern.position)
+                try checkPattern(innerPattern, against: resolveType(leftType), context: &context)
+                return
+            case .patternInr(let innerPattern, _):
+                let leftType = freshTypeVar()
+                let rightType = freshTypeVar()
+                try unifyForPattern(resolvedType, .sum(left: leftType, right: rightType), position: pattern.position)
+                try checkPattern(innerPattern, against: resolveType(rightType), context: &context)
+                return
+            case .patternCons(let head, let tail, _):
+                let elemType = freshTypeVar()
+                try unifyForPattern(resolvedType, .list(elemType), position: pattern.position)
+                let resolvedElem = resolveType(elemType)
+                try checkPattern(head, against: resolvedElem, context: &context)
+                try checkPattern(tail, against: .list(resolvedElem), context: &context)
+                return
+            case .patternList(let patterns, _):
+                let elemType = freshTypeVar()
+                try unifyForPattern(resolvedType, .list(elemType), position: pattern.position)
+                let resolvedElem = resolveType(elemType)
+                for pat in patterns {
+                    try checkPattern(pat, against: resolvedElem, context: &context)
+                }
+                return
+            case .patternTuple(let patterns, _):
+                let types = patterns.map { _ in freshTypeVar() }
+                try unifyForPattern(resolvedType, .tuple(types), position: pattern.position)
+                for (pat, ty) in zip(patterns, types) {
+                    try checkPattern(pat, against: resolveType(ty), context: &context)
+                }
+                return
+            case .patternRecord(let labelledPatterns, _):
+                let fieldTypes = labelledPatterns.map {
+                    RecordFieldType(label: $0.label, fieldType: freshTypeVar())
+                }
+                try unifyForPattern(resolvedType, .record(fieldTypes), position: pattern.position)
+                for (lp, ft) in zip(labelledPatterns, fieldTypes) {
+                    try checkPattern(lp.pattern, against: resolveType(ft.fieldType), context: &context)
+                }
+                return
+            case .patternTrue, .patternFalse:
+                try unifyForPattern(resolvedType, .bool, position: pattern.position)
+                return
+            case .patternInt(let n, let pos):
+                if n < 0 { throw TypeCheckError.errorIllegalNegativeLiteral(position: pos) }
+                try unifyForPattern(resolvedType, .nat, position: pattern.position)
+                return
+            case .patternSucc(let innerPattern, _):
+                try unifyForPattern(resolvedType, .nat, position: pattern.position)
+                try checkPattern(innerPattern, against: .nat, context: &context)
+                return
+            case .patternUnit:
+                try unifyForPattern(resolvedType, .unit, position: pattern.position)
+                return
+            default:
+                break
+            }
+        }
+
+        switch (pattern, resolvedType) {
         case (.patternVar(let name, _), _):
-            context[name] = type
+            context[name] = resolvedType
 
         case (.patternTrue, .bool), (.patternFalse, .bool):
             break
@@ -1333,7 +1711,7 @@ class TypeChecker {
 
         case (.patternTuple(let patterns, _), .tuple(let types)):
             guard patterns.count == types.count else {
-                throw TypeCheckError.errorUnexpectedPatternForType(pattern: pattern, type: type)
+                throw TypeCheckError.errorUnexpectedPatternForType(pattern: pattern, type: resolvedType)
             }
             for (pat, ty) in zip(patterns, types) {
                 try checkPattern(pat, against: ty, context: &context)
@@ -1350,52 +1728,50 @@ class TypeChecker {
 
         case (.patternVariant(let label, let innerPat, _), .variant(let fields)):
             guard let field = fields.first(where: { $0.label == label }) else {
-                throw TypeCheckError.errorUnexpectedPatternForType(pattern: pattern, type: type)
+                throw TypeCheckError.errorUnexpectedPatternForType(pattern: pattern, type: resolvedType)
             }
             switch (innerPat, field.fieldType) {
             case (nil, nil): break
             case (let pat?, let fieldType?):
                 try checkPattern(pat, against: fieldType, context: &context)
             default:
-                throw TypeCheckError.errorUnexpectedPatternForType(pattern: pattern, type: type)
+                throw TypeCheckError.errorUnexpectedPatternForType(pattern: pattern, type: resolvedType)
             }
 
         case (.patternRecord(let labelledPatterns, _), .record(let fields)):
             for lp in labelledPatterns {
                 guard let field = fields.first(where: { $0.label == lp.label }) else {
-                    throw TypeCheckError.errorUnexpectedPatternForType(pattern: pattern, type: type)
+                    throw TypeCheckError.errorUnexpectedPatternForType(pattern: pattern, type: resolvedType)
                 }
                 try checkPattern(lp.pattern, against: field.fieldType, context: &context)
             }
 
         default:
-            throw TypeCheckError.errorUnexpectedPatternForType(pattern: pattern, type: type)
+            throw TypeCheckError.errorUnexpectedPatternForType(pattern: pattern, type: resolvedType)
         }
     }
 
-    /// Helper: adds pattern variable bindings to `context` without type-compatibility checking
-    /// (used for let/letrec where we already know the RHS type).
     private func bindPattern(_ pattern: Pattern, to type: Type, context: inout TypeContext) throws {
         if case .patternVar(let name, _) = pattern {
             context[name] = type
         } else {
-            // For structural patterns in let bindings, delegate to checkPattern
             try checkPattern(pattern, against: type, context: &context)
         }
     }
 
     // MARK: - Exhaustiveness Checking
 
-    /// Verifies that the `patterns` cover all cases for the given scrutinee `type`.
     private func checkExhaustiveness(patterns: [Pattern], against type: Type, position: SourcePosition) throws {
-        switch type {
+        let resolvedType = typeReconstruction ? resolveType(type) : type
+
+        switch resolvedType {
         case .sum:
             var hasInl = false, hasInr = false
             for p in patterns {
                 switch p {
                 case .patternInl: hasInl = true
                 case .patternInr: hasInr = true
-                case .patternVar: hasInl = true; hasInr = true  // wildcard
+                case .patternVar: hasInl = true; hasInr = true
                 default: break
                 }
             }
@@ -1427,7 +1803,7 @@ class TypeChecker {
                 switch p {
                 case .patternTrue: hasTrue = true
                 case .patternFalse: hasFalse = true
-                case .patternVar: hasTrue = true; hasFalse = true  // wildcard
+                case .patternVar: hasTrue = true; hasFalse = true
                 default: break
                 }
             }
@@ -1436,16 +1812,12 @@ class TypeChecker {
             }
 
         default:
-            // For Nat, list, etc. — a patternVar (wildcard) is accepted as exhaustive;
-            // full coverage analysis for Nat/list would require infinite case enumeration.
             break
         }
     }
 
     // MARK: - Type Validation
 
-    /// Recursively validates that a type is structurally well-formed
-    /// (no duplicate record field names or variant labels).
     private func validateType(_ type: Type, at position: SourcePosition = .unknown) throws {
         switch type {
         case .record(let fields):
@@ -1483,14 +1855,409 @@ class TypeChecker {
         case .ref(let innerType):
             try validateType(innerType, at: position)
 
-        case .bool, .nat, .unit, .top, .bot:
+        case .typeVar(let name):
+            if universalTypes && !typeVarScope.contains(name) {
+                throw TypeCheckError.errorUndefinedTypeVariable(name: name, position: position)
+            }
+
+        case .forAll(let typeVars, let bodyType):
+            let oldScope = typeVarScope
+            typeVarScope = typeVarScope.union(typeVars)
+            defer { typeVarScope = oldScope }
+            try validateType(bodyType, at: position)
+
+        case .bool, .nat, .unit, .top, .bot, .auto:
             break
+        }
+    }
+
+    // MARK: - Stage 3: Type Reconstruction — Auto Replacement
+    // These helpers implement the first pass of type reconstruction:
+    // every `auto` annotation is replaced by a globally-unique fresh type variable
+    // (e.g. ?T1, ?T2, …) that the unifier will later solve.
+
+    /// Allocate a fresh type variable with a unique numeric suffix.
+    private func freshTypeVar() -> Type {
+        nextTypeVarId += 1
+        return .typeVar(name: "?T\(nextTypeVarId)")
+    }
+
+    /// Replace every `auto` leaf in a type with a distinct fresh variable.
+    private func replaceAutoInType(_ type: Type) -> Type {
+        switch type {
+        case .auto: return freshTypeVar()
+        case .function(let ps, let r):
+            return .function(paramTypes: ps.map(replaceAutoInType), returnType: replaceAutoInType(r))
+        case .tuple(let ts): return .tuple(ts.map(replaceAutoInType))
+        case .record(let fs):
+            return .record(fs.map { RecordFieldType(label: $0.label, fieldType: replaceAutoInType($0.fieldType)) })
+        case .sum(let l, let r): return .sum(left: replaceAutoInType(l), right: replaceAutoInType(r))
+        case .list(let t): return .list(replaceAutoInType(t))
+        case .variant(let fs):
+            return .variant(fs.map { VariantFieldType(label: $0.label, fieldType: $0.fieldType.map(replaceAutoInType)) })
+        case .ref(let t): return .ref(replaceAutoInType(t))
+        case .forAll(let vs, let body): return .forAll(typeVars: vs, bodyType: replaceAutoInType(body))
+        default: return type
+        }
+    }
+
+    private func replaceAutoInDecl(_ decl: Decl) -> Decl {
+        switch decl {
+        case .declFun(let name, let params, let returnType, let localDecls, let returnExpr, let pos):
+            return .declFun(
+                name: name,
+                paramDecls: params.map { ParamDecl(name: $0.name, paramType: replaceAutoInType($0.paramType), position: $0.position) },
+                returnType: returnType.map(replaceAutoInType),
+                localDecls: localDecls.map(replaceAutoInDecl),
+                returnExpr: replaceAutoInExpr(returnExpr),
+                position: pos
+            )
+        case .declFunGeneric(let name, let tps, let params, let returnType, let localDecls, let returnExpr, let pos):
+            return .declFunGeneric(
+                name: name,
+                typeParams: tps,
+                paramDecls: params.map { ParamDecl(name: $0.name, paramType: replaceAutoInType($0.paramType), position: $0.position) },
+                returnType: returnType.map(replaceAutoInType),
+                localDecls: localDecls.map(replaceAutoInDecl),
+                returnExpr: replaceAutoInExpr(returnExpr),
+                position: pos
+            )
+        case .declExceptionType:
+            return decl
+        }
+    }
+
+    private func replaceAutoInExpr(_ expr: Expr) -> Expr {
+        switch expr {
+        case .constTrue, .constFalse, .constInt, .constUnit, .variable, .constMemory, .panic_:
+            return expr
+
+        case .abstraction(let params, let body, let pos):
+            return .abstraction(
+                paramDecls: params.map { ParamDecl(name: $0.name, paramType: replaceAutoInType($0.paramType), position: $0.position) },
+                returnExpr: replaceAutoInExpr(body), pos
+            )
+
+        case .application(let fun, let args, let pos):
+            return .application(fun: replaceAutoInExpr(fun), args: args.map(replaceAutoInExpr), pos)
+
+        case .ifExpr(let c, let t, let e, let pos):
+            return .ifExpr(condition: replaceAutoInExpr(c), thenExpr: replaceAutoInExpr(t), elseExpr: replaceAutoInExpr(e), pos)
+
+        case .succ(let n, let pos): return .succ(replaceAutoInExpr(n), pos)
+        case .pred(let n, let pos): return .pred(replaceAutoInExpr(n), pos)
+        case .isZero(let n, let pos): return .isZero(replaceAutoInExpr(n), pos)
+
+        case .natRec(let n, let i, let s, let pos):
+            return .natRec(n: replaceAutoInExpr(n), initial: replaceAutoInExpr(i), step: replaceAutoInExpr(s), pos)
+
+        case .letExpr(let bindings, let body, let pos):
+            let newBindings = bindings.map { PatternBinding(pattern: $0.pattern, rhs: replaceAutoInExpr($0.rhs)) }
+            return .letExpr(bindings: newBindings, body: replaceAutoInExpr(body), pos)
+
+        case .letRec(let bindings, let body, let pos):
+            let newBindings = bindings.map { PatternBinding(pattern: $0.pattern, rhs: replaceAutoInExpr($0.rhs)) }
+            return .letRec(bindings: newBindings, body: replaceAutoInExpr(body), pos)
+
+        case .typeAsc(let e, let t, let pos):
+            return .typeAsc(expr: replaceAutoInExpr(e), type: replaceAutoInType(t), pos)
+
+        case .tuple(let exprs, let pos): return .tuple(exprs.map(replaceAutoInExpr), pos)
+        case .dotTuple(let e, let idx, let pos): return .dotTuple(expr: replaceAutoInExpr(e), index: idx, pos)
+
+        case .record(let bindings, let pos):
+            return .record(bindings.map { Binding(name: $0.name, rhs: replaceAutoInExpr($0.rhs)) }, pos)
+        case .dotRecord(let e, let label, let pos): return .dotRecord(expr: replaceAutoInExpr(e), label: label, pos)
+
+        case .inl(let e, let pos): return .inl(replaceAutoInExpr(e), pos)
+        case .inr(let e, let pos): return .inr(replaceAutoInExpr(e), pos)
+
+        case .match(let scrutinee, let cases, let pos):
+            return .match(
+                expr: replaceAutoInExpr(scrutinee),
+                cases: cases.map { MatchCase(pattern: $0.pattern, expr: replaceAutoInExpr($0.expr)) },
+                pos
+            )
+
+        case .list(let exprs, let pos): return .list(exprs.map(replaceAutoInExpr), pos)
+        case .consList(let h, let t, let pos): return .consList(head: replaceAutoInExpr(h), tail: replaceAutoInExpr(t), pos)
+        case .head(let e, let pos): return .head(replaceAutoInExpr(e), pos)
+        case .tail(let e, let pos): return .tail(replaceAutoInExpr(e), pos)
+        case .isEmpty(let e, let pos): return .isEmpty(replaceAutoInExpr(e), pos)
+
+        case .variant(let label, let e, let pos):
+            return .variant(label: label, expr: e.map(replaceAutoInExpr), pos)
+
+        case .fix(let e, let pos): return .fix(replaceAutoInExpr(e), pos)
+
+        case .add(let l, let r, let pos): return .add(left: replaceAutoInExpr(l), right: replaceAutoInExpr(r), pos)
+        case .subtract(let l, let r, let pos): return .subtract(left: replaceAutoInExpr(l), right: replaceAutoInExpr(r), pos)
+        case .multiply(let l, let r, let pos): return .multiply(left: replaceAutoInExpr(l), right: replaceAutoInExpr(r), pos)
+        case .divide(let l, let r, let pos): return .divide(left: replaceAutoInExpr(l), right: replaceAutoInExpr(r), pos)
+
+        case .logicNot(let e, let pos): return .logicNot(replaceAutoInExpr(e), pos)
+        case .logicAnd(let l, let r, let pos): return .logicAnd(left: replaceAutoInExpr(l), right: replaceAutoInExpr(r), pos)
+        case .logicOr(let l, let r, let pos): return .logicOr(left: replaceAutoInExpr(l), right: replaceAutoInExpr(r), pos)
+
+        case .lessThan(let l, let r, let pos): return .lessThan(left: replaceAutoInExpr(l), right: replaceAutoInExpr(r), pos)
+        case .lessThanOrEqual(let l, let r, let pos): return .lessThanOrEqual(left: replaceAutoInExpr(l), right: replaceAutoInExpr(r), pos)
+        case .greaterThan(let l, let r, let pos): return .greaterThan(left: replaceAutoInExpr(l), right: replaceAutoInExpr(r), pos)
+        case .greaterThanOrEqual(let l, let r, let pos): return .greaterThanOrEqual(left: replaceAutoInExpr(l), right: replaceAutoInExpr(r), pos)
+        case .equal(let l, let r, let pos): return .equal(left: replaceAutoInExpr(l), right: replaceAutoInExpr(r), pos)
+        case .notEqual(let l, let r, let pos): return .notEqual(left: replaceAutoInExpr(l), right: replaceAutoInExpr(r), pos)
+
+        case .sequence(let e1, let e2, let pos):
+            return .sequence(expr1: replaceAutoInExpr(e1), expr2: replaceAutoInExpr(e2), pos)
+
+        case .newRef(let e, let pos): return .newRef(replaceAutoInExpr(e), pos)
+        case .deref(let e, let pos): return .deref(replaceAutoInExpr(e), pos)
+        case .assign(let l, let r, let pos): return .assign(lhs: replaceAutoInExpr(l), rhs: replaceAutoInExpr(r), pos)
+
+        case .throw_(let e, let pos): return .throw_(replaceAutoInExpr(e), pos)
+        case .tryWith(let t, let f, let pos): return .tryWith(tryExpr: replaceAutoInExpr(t), fallbackExpr: replaceAutoInExpr(f), pos)
+        case .tryCatch(let t, let p, let f, let pos):
+            return .tryCatch(tryExpr: replaceAutoInExpr(t), pattern: p, fallbackExpr: replaceAutoInExpr(f), pos)
+
+        case .typeCast(let e, let t, let pos): return .typeCast(expr: replaceAutoInExpr(e), type: replaceAutoInType(t), pos)
+        case .parenthesised(let e, let pos): return .parenthesised(replaceAutoInExpr(e), pos)
+
+        case .typeAbstraction(let tvs, let body, let pos):
+            return .typeAbstraction(typeVars: tvs, body: replaceAutoInExpr(body), pos)
+        case .typeApplication(let e, let ts, let pos):
+            return .typeApplication(expr: replaceAutoInExpr(e), types: ts.map(replaceAutoInType), pos)
+        }
+    }
+
+    // MARK: - Stage 3: Type Reconstruction — Unification
+    // Standard union-find style unification.
+    // resolveType  — walk the substitution chain to find a type's current representative.
+    // occursIn     — occurs check; prevents unifying ?T with a type that mentions ?T (infinite type).
+    // unify        — generate the most general unifier for two types, extending `substitution`.
+
+    /// Follow the substitution chain for `type`, applying path compression along the way.
+    private func resolveType(_ type: Type) -> Type {
+        switch type {
+        case .typeVar(let name):
+            if let resolved = substitution[name] {
+                let result = resolveType(resolved)
+                substitution[name] = result
+                return result
+            }
+            return type
+        case .function(let params, let ret):
+            return .function(paramTypes: params.map(resolveType), returnType: resolveType(ret))
+        case .tuple(let types):
+            return .tuple(types.map(resolveType))
+        case .record(let fields):
+            return .record(fields.map { RecordFieldType(label: $0.label, fieldType: resolveType($0.fieldType)) })
+        case .sum(let l, let r):
+            return .sum(left: resolveType(l), right: resolveType(r))
+        case .list(let t):
+            return .list(resolveType(t))
+        case .variant(let fields):
+            return .variant(fields.map { VariantFieldType(label: $0.label, fieldType: $0.fieldType.map(resolveType)) })
+        case .ref(let t):
+            return .ref(resolveType(t))
+        case .forAll(let vs, let body):
+            return .forAll(typeVars: vs, bodyType: resolveType(body))
+        default:
+            return type
+        }
+    }
+
+    /// True if the free type variable `name` appears anywhere in `type` (after full resolution).
+    private func occursIn(name: String, type: Type) -> Bool {
+        let resolved = resolveType(type)
+        switch resolved {
+        case .typeVar(let n): return n == name
+        case .function(let ps, let r): return ps.contains { occursIn(name: name, type: $0) } || occursIn(name: name, type: r)
+        case .tuple(let ts): return ts.contains { occursIn(name: name, type: $0) }
+        case .record(let fs): return fs.contains { occursIn(name: name, type: $0.fieldType) }
+        case .sum(let l, let r): return occursIn(name: name, type: l) || occursIn(name: name, type: r)
+        case .list(let t): return occursIn(name: name, type: t)
+        case .variant(let fs): return fs.contains { f in f.fieldType.map { occursIn(name: name, type: $0) } ?? false }
+        case .ref(let t): return occursIn(name: name, type: t)
+        case .forAll(_, let body): return occursIn(name: name, type: body)
+        default: return false
+        }
+    }
+
+    /// Unify two types, extending the substitution.  Structural cases recurse; a type variable
+    /// on either side is bound to the other type (after the occurs check).
+    /// Raises ERROR_OCCURS_CHECK_INFINITE_TYPE when unification would produce an infinite type,
+    /// and ERROR_UNEXPECTED_TYPE_FOR_EXPRESSION when the two types are structurally incompatible.
+    private func unify(_ t1: Type, _ t2: Type, expr: Expr) throws {
+        let r1 = resolveType(t1)
+        let r2 = resolveType(t2)
+
+        if r1 == r2 { return }
+
+        switch (r1, r2) {
+        case (.typeVar(let name), _):
+            if occursIn(name: name, type: r2) {
+                throw TypeCheckError.errorOccursCheckInfiniteType(position: expr.position)
+            }
+            substitution[name] = r2
+
+        case (_, .typeVar(let name)):
+            if occursIn(name: name, type: r1) {
+                throw TypeCheckError.errorOccursCheckInfiniteType(position: expr.position)
+            }
+            substitution[name] = r1
+
+        case (.function(let p1, let ret1), .function(let p2, let ret2)):
+            guard p1.count == p2.count else {
+                throw TypeCheckError.errorUnexpectedTypeForExpression(expected: r2, found: r1, expr: expr)
+            }
+            for (a, b) in zip(p1, p2) {
+                try unify(a, b, expr: expr)
+            }
+            try unify(ret1, ret2, expr: expr)
+
+        case (.tuple(let ts1), .tuple(let ts2)):
+            guard ts1.count == ts2.count else {
+                throw TypeCheckError.errorUnexpectedTypeForExpression(expected: r2, found: r1, expr: expr)
+            }
+            for (a, b) in zip(ts1, ts2) {
+                try unify(a, b, expr: expr)
+            }
+
+        case (.record(let fs1), .record(let fs2)):
+            guard fs1.count == fs2.count else {
+                throw TypeCheckError.errorUnexpectedTypeForExpression(expected: r2, found: r1, expr: expr)
+            }
+            let sorted1 = fs1.sorted { $0.label < $1.label }
+            let sorted2 = fs2.sorted { $0.label < $1.label }
+            for (f1, f2) in zip(sorted1, sorted2) {
+                guard f1.label == f2.label else {
+                    throw TypeCheckError.errorUnexpectedTypeForExpression(expected: r2, found: r1, expr: expr)
+                }
+                try unify(f1.fieldType, f2.fieldType, expr: expr)
+            }
+
+        case (.sum(let l1, let r1_), .sum(let l2, let r2_)):
+            try unify(l1, l2, expr: expr)
+            try unify(r1_, r2_, expr: expr)
+
+        case (.list(let e1), .list(let e2)):
+            try unify(e1, e2, expr: expr)
+
+        case (.variant(let fs1), .variant(let fs2)):
+            guard fs1.count == fs2.count else {
+                throw TypeCheckError.errorUnexpectedTypeForExpression(expected: r2, found: r1, expr: expr)
+            }
+            for (f1, f2) in zip(fs1, fs2) {
+                guard f1.label == f2.label else {
+                    throw TypeCheckError.errorUnexpectedTypeForExpression(expected: r2, found: r1, expr: expr)
+                }
+                switch (f1.fieldType, f2.fieldType) {
+                case (let t1?, let t2?): try unify(t1, t2, expr: expr)
+                case (nil, nil): break
+                default: throw TypeCheckError.errorUnexpectedTypeForExpression(expected: r2, found: r1, expr: expr)
+                }
+            }
+
+        case (.ref(let t1_), .ref(let t2_)):
+            try unify(t1_, t2_, expr: expr)
+
+        case (.bool, .nat), (.nat, .bool),
+             (.bool, .unit), (.unit, .bool),
+             (.nat, .unit), (.unit, .nat):
+            throw TypeCheckError.errorUnexpectedTypeForExpression(expected: r2, found: r1, expr: expr)
+
+        default:
+            throw TypeCheckError.errorUnexpectedTypeForExpression(expected: r2, found: r1, expr: expr)
+        }
+    }
+
+    // MARK: - Stage 3: Universal Types — Type Substitution
+
+    /// Substitute free type variables in `type` according to `mapping`.
+    /// For `forAll` binders, bound variables shadow the mapping (not substituted),
+    /// and capture-avoiding renaming is applied when a bound name would capture
+    /// a free variable introduced by the substitution.
+    private func substituteTypeVars(in type: Type, mapping: [String: Type]) -> Type {
+        switch type {
+        case .typeVar(let name):
+            return mapping[name] ?? type
+        case .function(let params, let ret):
+            return .function(
+                paramTypes: params.map { substituteTypeVars(in: $0, mapping: mapping) },
+                returnType: substituteTypeVars(in: ret, mapping: mapping)
+            )
+        case .tuple(let types):
+            return .tuple(types.map { substituteTypeVars(in: $0, mapping: mapping) })
+        case .record(let fields):
+            return .record(fields.map {
+                RecordFieldType(label: $0.label, fieldType: substituteTypeVars(in: $0.fieldType, mapping: mapping))
+            })
+        case .sum(let left, let right):
+            return .sum(
+                left: substituteTypeVars(in: left, mapping: mapping),
+                right: substituteTypeVars(in: right, mapping: mapping)
+            )
+        case .list(let elemType):
+            return .list(substituteTypeVars(in: elemType, mapping: mapping))
+        case .variant(let fields):
+            return .variant(fields.map {
+                VariantFieldType(label: $0.label, fieldType: $0.fieldType.map { substituteTypeVars(in: $0, mapping: mapping) })
+            })
+        case .ref(let innerType):
+            return .ref(substituteTypeVars(in: innerType, mapping: mapping))
+        case .forAll(let typeVars, let bodyType):
+            var filteredMapping = mapping
+            for tv in typeVars {
+                filteredMapping.removeValue(forKey: tv)
+            }
+            // Capture-avoiding: check if any bound variable captures a free variable in substituted types
+            let freeInSubstitution = Set(filteredMapping.values.flatMap { freeTypeVarsIn($0) })
+            var renamedVars = typeVars
+            var renaming: [String: Type] = [:]
+            for (i, tv) in typeVars.enumerated() {
+                if freeInSubstitution.contains(tv) {
+                    let fresh = "__ca_\(tv)_\(nextTypeVarId)"
+                    nextTypeVarId += 1
+                    renamedVars[i] = fresh
+                    renaming[tv] = .typeVar(name: fresh)
+                }
+            }
+            var innerBody = bodyType
+            if !renaming.isEmpty {
+                innerBody = substituteTypeVars(in: innerBody, mapping: renaming)
+            }
+            return .forAll(typeVars: renamedVars, bodyType: substituteTypeVars(in: innerBody, mapping: filteredMapping))
+        default:
+            return type
         }
     }
 
     // MARK: - Helpers
 
-    /// Returns sorted array of elements that appear more than once in `array`.
+    private func freeTypeVarsIn(_ type: Type) -> Set<String> {
+        switch type {
+        case .typeVar(let name):
+            return [name]
+        case .function(let params, let ret):
+            return params.reduce(Set<String>()) { $0.union(freeTypeVarsIn($1)) }.union(freeTypeVarsIn(ret))
+        case .tuple(let types):
+            return types.reduce(Set<String>()) { $0.union(freeTypeVarsIn($1)) }
+        case .record(let fields):
+            return fields.reduce(Set<String>()) { $0.union(freeTypeVarsIn($1.fieldType)) }
+        case .sum(let left, let right):
+            return freeTypeVarsIn(left).union(freeTypeVarsIn(right))
+        case .list(let elemType):
+            return freeTypeVarsIn(elemType)
+        case .variant(let fields):
+            return fields.reduce(Set<String>()) { $0.union($1.fieldType.map { freeTypeVarsIn($0) } ?? []) }
+        case .ref(let innerType):
+            return freeTypeVarsIn(innerType)
+        case .forAll(let typeVars, let bodyType):
+            return freeTypeVarsIn(bodyType).subtracting(typeVars)
+        default:
+            return []
+        }
+    }
+
     private func findDuplicates(in array: [String]) -> [String] {
         var seen = Set<String>()
         var duplicates = Set<String>()

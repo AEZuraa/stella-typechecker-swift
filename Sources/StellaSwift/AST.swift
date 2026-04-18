@@ -41,6 +41,17 @@ enum Decl: Sendable {
     )
     /// Top-level exception type declaration: `exception type = T`
     case declExceptionType(type: Type, position: SourcePosition)
+
+    // --- Stage 3: generic function declaration (#universal-types) ---
+    case declFunGeneric(
+        name: String,
+        typeParams: [String],
+        paramDecls: [ParamDecl],
+        returnType: Type?,
+        localDecls: [Decl],
+        returnExpr: Expr,
+        position: SourcePosition
+    )
 }
 
 struct ParamDecl: Sendable { // represents a function parameter (`n : Nat`)
@@ -64,9 +75,14 @@ indirect enum Type: Sendable {
     case ref(Type)                                         // &T  (#references)
     case top                                               // Top (#top-type)
     case bot                                               // Bot (#bottom-type)
+
+    // --- Stage 3 ---
+    case auto                                              // auto (#type-reconstruction)
+    case typeVar(name: String)                             // Type variable: X, Y, ?T1
+    case forAll(typeVars: [String], bodyType: Type)        // forall X. T (#universal-types)
     
     var position: SourcePosition {
-        return .unknown // can be expanded for storage of items
+        return .unknown
     }
 }
 
@@ -179,6 +195,10 @@ indirect enum Expr: Sendable {
     
     // Parenthesised
     case parenthesised(Expr, SourcePosition)
+
+    // --- Stage 3: Universal types (#universal-types) ---
+    case typeAbstraction(typeVars: [String], body: Expr, SourcePosition)   // generic [X] expr
+    case typeApplication(expr: Expr, types: [Type], SourcePosition)        // expr[T]
     
     var position: SourcePosition {
         switch self {
@@ -200,7 +220,8 @@ indirect enum Expr: Sendable {
              .newRef(_, let pos), .deref(_, let pos), .assign(_, _, let pos),
              .constMemory(_, let pos), .panic_(let pos),
              .throw_(_, let pos), .tryWith(_, _, let pos), .tryCatch(_, _, _, let pos),
-             .typeCast(_, _, let pos):
+             .typeCast(_, _, let pos),
+             .typeAbstraction(_, _, let pos), .typeApplication(_, _, let pos):
             return pos
         }
     }
@@ -368,8 +389,27 @@ extension Expr: CustomStringConvertible {
             return "\(expr) cast as \(type)"
         case .parenthesised(let expr, _):
             return "(\(expr))"
-        default:
-            return "Expr(...)"
+        case .typeAbstraction(let typeVars, let body, _):
+            return "generic [\(typeVars.joined(separator: ", "))] \(body)"
+        case .typeApplication(let expr, let types, _):
+            let typeStr = types.map { "\($0)" }.joined(separator: ", ")
+            return "\(expr)[\(typeStr)]"
+        case .letRec(let bindings, let body, _):
+            let bindStr = bindings.map { "\($0.pattern) = \($0.rhs)" }.joined(separator: ", ")
+            return "letrec \(bindStr) in \(body)"
+        case .add(let l, let r, _): return "\(l) + \(r)"
+        case .subtract(let l, let r, _): return "\(l) - \(r)"
+        case .multiply(let l, let r, _): return "\(l) * \(r)"
+        case .divide(let l, let r, _): return "\(l) / \(r)"
+        case .logicNot(let e, _): return "not(\(e))"
+        case .logicAnd(let l, let r, _): return "\(l) and \(r)"
+        case .logicOr(let l, let r, _): return "\(l) or \(r)"
+        case .lessThan(let l, let r, _): return "\(l) < \(r)"
+        case .lessThanOrEqual(let l, let r, _): return "\(l) <= \(r)"
+        case .greaterThan(let l, let r, _): return "\(l) > \(r)"
+        case .greaterThanOrEqual(let l, let r, _): return "\(l) >= \(r)"
+        case .equal(let l, let r, _): return "\(l) == \(r)"
+        case .notEqual(let l, let r, _): return "\(l) != \(r)"
         }
     }
 }
@@ -408,6 +448,12 @@ extension Type: CustomStringConvertible {
             return "Top"
         case .bot:
             return "Bot"
+        case .auto:
+            return "auto"
+        case .typeVar(let name):
+            return name
+        case .forAll(let typeVars, let bodyType):
+            return "forall \(typeVars.joined(separator: " ")). \(bodyType)"
         }
     }
 }
@@ -445,6 +491,12 @@ extension Type: Equatable {
             return t1 == t2
         case (.top, .top), (.bot, .bot):
             return true
+        case (.auto, .auto):
+            return true
+        case (.typeVar(let n1), .typeVar(let n2)):
+            return n1 == n2
+        case (.forAll(let v1, let t1), .forAll(let v2, let t2)):
+            return v1 == v2 && t1 == t2
         default:
             return false
         }

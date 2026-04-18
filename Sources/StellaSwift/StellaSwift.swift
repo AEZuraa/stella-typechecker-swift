@@ -234,6 +234,22 @@ extension StellaSwift {
             print("\(indentStr)   Body: \(summarizeExpr(returnExpr))")
         case .declExceptionType(let type, _):
             print("\(indentStr)\(index). Exception type declaration: \(type)")
+        case .declFunGeneric(let name, let typeParams, let params, let returnType, let localDecls, let returnExpr, _):
+            print("\(indentStr)\(index). Generic Function '\(name)' [\(typeParams.joined(separator: ", "))]")
+            print("\(indentStr)   Parameters:")
+            for (i, param) in params.enumerated() {
+                print("\(indentStr)     \(i + 1). \(param.name) : \(param.paramType)")
+            }
+            if let retType = returnType {
+                print("\(indentStr)   Return type: \(retType)")
+            }
+            if !localDecls.isEmpty {
+                print("\(indentStr)   Local declarations:")
+                for (i, localDecl) in localDecls.enumerated() {
+                    printDecl(localDecl, indent: indent + 2, index: i + 1)
+                }
+            }
+            print("\(indentStr)   Body: \(summarizeExpr(returnExpr))")
         }
     }
     
@@ -321,6 +337,10 @@ extension StellaSwift {
             return "cast-as(\(type))"
         case .parenthesised(let inner, _):
             return "(\(summarizeExpr(inner)))"
+        case .typeAbstraction(let tvs, _, _):
+            return "generic [\(tvs.joined(separator: ", "))] ..."
+        case .typeApplication(_, let types, _):
+            return "typeApp[\(types.count) types]"
         }
     }
 }

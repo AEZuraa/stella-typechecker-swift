@@ -791,6 +791,80 @@ class ASTBuilder: stellaParserBaseListener {
         ))
     }
     
+    // MARK: - Stage 3: Types (#type-reconstruction, #universal-types)
+
+    /// auto — placeholder type for type reconstruction
+    override func exitTypeAuto(_ ctx: stellaParser.TypeAutoContext) {
+        typeStack.append(.auto)
+    }
+
+    /// Type variable (X, Y, etc.) used in universal types
+    override func exitTypeVar(_ ctx: stellaParser.TypeVarContext) {
+        let name = ctx.name?.getText() ?? ""
+        typeStack.append(.typeVar(name: name))
+    }
+
+    /// forall X Y. T — universally quantified type
+    override func exitTypeForAll(_ ctx: stellaParser.TypeForAllContext) {
+        guard let bodyType = typeStack.popLast() else {
+            fatalError("Missing body type in TypeForAll")
+        }
+        let typeVars = ctx.types.compactMap { $0.getText() }
+        typeStack.append(.forAll(typeVars: typeVars, bodyType: bodyType))
+    }
+
+    // MARK: - Stage 3: Declarations (#universal-types)
+
+    /// generic fn name[T](...) -> RetType { ... }
+    override func exitDeclFunGeneric(_ ctx: stellaParser.DeclFunGenericContext) {
+        guard let returnExpr = exprStack.popLast() else {
+            fatalError("Missing return expression in generic function declaration")
+        }
+
+        let localDeclCount = ctx.localDecls.count
+        let localDecls = (0..<localDeclCount).compactMap { _ in declStack.popLast() }.reversed()
+        let returnType = ctx.returnType != nil ? typeStack.popLast() : nil
+        let paramCount = ctx.paramDecls.count
+        let params = (0..<paramCount).compactMap { _ in paramDeclStack.popLast() }.reversed()
+        let name = ctx.name?.getText() ?? ""
+        let typeParams = ctx.generics.compactMap { $0.getText() }
+
+        let decl = Decl.declFunGeneric(
+            name: name,
+            typeParams: typeParams,
+            paramDecls: Array(params),
+            returnType: returnType,
+            localDecls: Array(localDecls),
+            returnExpr: returnExpr,
+            position: getPosition(ctx)
+        )
+
+        declStack.append(decl)
+    }
+
+    // MARK: - Stage 3: Expressions (#universal-types)
+
+    /// generic [X, Y] expr — type abstraction
+    override func exitTypeAbstraction(_ ctx: stellaParser.TypeAbstractionContext) {
+        guard let body = exprStack.popLast() else {
+            fatalError("Missing body in type abstraction")
+        }
+        let typeVars = ctx.generics.compactMap { $0.getText() }
+        exprStack.append(.typeAbstraction(typeVars: typeVars, body: body, getPosition(ctx)))
+    }
+
+    /// expr[T1, T2] — type application
+    override func exitTypeApplication(_ ctx: stellaParser.TypeApplicationContext) {
+        let typeCount = ctx.types.count
+        let types = (0..<typeCount).compactMap { _ in typeStack.popLast() }.reversed()
+
+        guard let expr = exprStack.popLast() else {
+            fatalError("Missing expression in type application")
+        }
+
+        exprStack.append(.typeApplication(expr: expr, types: Array(types), getPosition(ctx)))
+    }
+
     // MARK: - Stage 2: Types (#references, #top-type, #bottom-type)
     
     /// &T — reference type
